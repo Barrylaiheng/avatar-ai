@@ -33,6 +33,9 @@ AvatarAIAdmin/
 *.lic.bak
 *.mc
 
+# 配置文件（含密钥，不进仓库）
+data/config.json
+
 # =============== 敏感凭证（方案 A：git 永远不跟踪） ===============
 app/storage/_secrets.py
 *_secrets.py
@@ -46,6 +49,9 @@ tests/_smoke_*.py
 # =============== 日志 ===============
 *.log
 logs/
+
+# =============== 测试临时数据 ===============
+tests/data/tmp_*/
 
 # =============== 系统 ===============
 .DS_Store
