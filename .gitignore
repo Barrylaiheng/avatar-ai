@@ -28,6 +28,14 @@ app/storage/*.db-journal
 app/storage/*.db-wal
 app/storage/*.db-shm
 app/storage/license.dat
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# =============== 临时文件 ===============
+_tmp.js
+_tmp.py
 AvatarAIAdmin/
 *.lic
 *.lic.bak
