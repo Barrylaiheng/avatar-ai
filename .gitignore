@@ -49,6 +49,7 @@ app/storage/_secrets.py
 *_secrets.py
 .env
 secrets.json
+*.pem
 
 # =============== 临时脚本（开发调试用，不进仓库） ===============
 _*.py
