@@ -11,6 +11,8 @@
 
 <img src="image/example.png" width="640">
 
+<img src="image/knowledge.png" width="640">
+
 ### 功能
 
 - **身份模拟**：AI 学习你的语气、习惯、偏好，回复像你本人
