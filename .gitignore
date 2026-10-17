@@ -1,0 +1,76 @@
+# =============== Python ===============
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+venv/
+env/
+.venv/
+
+# =============== PyInstaller 打包产物 ===============
+build/
+dist/
+*.spec
+
+# =============== IDE ===============
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# =============== 上下文锁文件 ===============
+.ctx.lock
+
+# =============== 数据库 & 数据文件（绝对不能进仓库） ===============
+app/storage/*.db
+app/storage/*.db-journal
+app/storage/*.db-wal
+app/storage/*.db-shm
+app/storage/license.dat
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# =============== 临时文件 ===============
+_tmp.js
+_tmp.py
+AvatarAIAdmin/
+*.lic
+*.lic.bak
+*.mc
+
+# 配置文件（含密钥，不进仓库）
+data/config.json
+
+# =============== 敏感凭证（方案 A：git 永远不跟踪） ===============
+app/storage/_secrets.py
+*_secrets.py
+.env
+secrets.json
+*.pem
+
+# =============== 临时脚本（开发调试用，不进仓库） ===============
+_*.py
+tests/_smoke_*.py
+
+# =============== 日志 ===============
+*.log
+logs/
+
+# =============== 测试临时数据 ===============
+tests/data/tmp_*/
+
+# =============== 系统 ===============
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============== QtWebEngine 缓存 ===============
+WebEngineCache/
+QtWebEngineProcess*
+
+# =============== 其他 ===============
+*.bak
+*.tmp
