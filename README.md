@@ -35,10 +35,6 @@ Avatar AI 是一款**桌面端可视化 Personal AI 工作台**。
 
 ![Avatar AI 工作台](image/avatar-ai-workbench.png)
 
-产品介绍 — 可视化配置，知识库/记忆/对话历史全部本地化，智能体任意搭配多渠道消息：
-
-![Avatar AI 产品介绍](image/avatar-ai-intro.png)
-
 ---
 
 ## 核心卖点（别人没有的）
