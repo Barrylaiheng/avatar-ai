@@ -1,8 +1,10 @@
-# Avatar AI · 把资料变成会干活的数字人
+# Avatar AI · 你的 Personal AI 工作台
 
-> 给 AI 装上你的人设、你的知识库、你的沟通渠道——它就能替你 7×24 接待客户、回复消息、跟进线索。
+> Windows 桌面端可视化 Personal AI 工作台。
 > 
-> Windows 桌面工作台，**免费版可长期使用**（不是试用版）。
+> 可视化配置，知识库、记忆、对话历史全部本地化，智能体任意搭配多渠道消息。
+> 
+> **免费版可长期使用**（不是试用版）。
 
 ![Version](https://img.shields.io/badge/version-v2.10.0-4a90d9)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
