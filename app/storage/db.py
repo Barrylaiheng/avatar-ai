@@ -43,10 +43,62 @@ _LOCK = threading.Lock()
 _CONN: sqlite3.Connection | None = None
 
 
+# ---- 写操作抗 BUSY：把重试放在**连接层**，所有写路径自动受益 ----
+# 本项目多进程共用同一个 SQLite 文件（主程序 / MCP server / 多开实例），
+# WAL 下写-写互斥，瞬时 SQLITE_BUSY（"database is locked"）属常态。
+# 全仓的写都是 `conn.execute(...)` + `conn.commit()`（无 .cursor() / executescript），
+# 因此覆写这两个方法即可覆盖全部写路径，调用点不必各自兜底。
+# 非 BUSY 的 OperationalError（如表/列不存在）不重试，原样抛出，避免掩盖真实错误。
+_BUSY_MAX_ATTEMPTS = 3
+_BUSY_BASE_DELAY = 0.5
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg or "database is busy" in msg
+
+
+class BusyRetryConnection(sqlite3.Connection):
+    """遇到 SQLITE_BUSY 自动退避重试的 Connection。
+
+    单次 execute/commit 内部已含 PRAGMA busy_timeout 的等待（默认 15s），
+    这里再补 3 次退避重试（0.5s/1s），用于「写锁被别的进程短暂攥住」的场景。
+    最坏情况会多等 ~46s 才抛错；正常情况（锁只有毫秒级）第 1 次即成功。
+    """
+
+    def execute(self, sql, parameters=()):  # type: ignore[override]
+        return self._retry_busy(lambda: sqlite3.Connection.execute(self, sql, parameters))
+
+    def executemany(self, sql, seq_of_parameters):  # type: ignore[override]
+        return self._retry_busy(
+            lambda: sqlite3.Connection.executemany(self, sql, seq_of_parameters))
+
+    def executescript(self, sql_script):  # type: ignore[override]
+        return self._retry_busy(lambda: sqlite3.Connection.executescript(self, sql_script))
+
+    def commit(self):  # type: ignore[override]
+        return self._retry_busy(lambda: sqlite3.Connection.commit(self))
+
+    def _retry_busy(self, op):
+        delay = _BUSY_BASE_DELAY
+        for attempt in range(_BUSY_MAX_ATTEMPTS):
+            try:
+                return op()
+            except sqlite3.OperationalError as e:
+                if not _is_busy_error(e):
+                    raise
+                if attempt == _BUSY_MAX_ATTEMPTS - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+
+
 def _create_connection() -> sqlite3.Connection:
-    """创建新的 SQLite 连接（启用外键、行工厂、WAL）。"""
+    """创建新的 SQLite 连接（启用外键、行工厂、WAL、BUSY 重试）。"""
     path = get_db_path()
-    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=5)
+    conn = sqlite3.connect(
+        str(path), check_same_thread=False, timeout=5, factory=BusyRetryConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")

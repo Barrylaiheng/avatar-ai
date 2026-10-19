@@ -38,7 +38,12 @@ def _ensure_conn() -> sqlite3.Connection:
     global _CONN
     with _LOCK:
         if _CONN is None:
-            _CONN = sqlite3.connect(str(_get_db_path()), check_same_thread=False, timeout=5)
+            # 与主库共用同一个文件，同样启用 BUSY 重试连接（多进程写竞争兜底）
+            from storage.db import BusyRetryConnection
+            _CONN = sqlite3.connect(
+                str(_get_db_path()), check_same_thread=False, timeout=5,
+                factory=BusyRetryConnection,
+            )
             _CONN.row_factory = sqlite3.Row
             _CONN.execute("PRAGMA journal_mode = WAL")
             _CONN.execute("PRAGMA busy_timeout = 5000")
