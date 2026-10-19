@@ -217,6 +217,34 @@ def test_patch_order_fix():
     print("[ok] D. subprocess 补丁顺序：先 import asyncio，import main 后 asyncio/APScheduler 仍可导入")
 
 
+def test_single_connection_alias():
+    """回归：`app.storage.db` 与 `storage.db` 必须归一到同一模块/同一条连接。
+
+    否则同一份 db.py 被执行两遍 → 进程内两条 sqlite 连接争同一把写锁 →
+    间歇性 `database is locked`（调度器每分钟写 next_run_at 都会失败）。
+    必须在【全新子进程】里分别验证两种 import 顺序。
+    """
+    import subprocess as sp
+    for order in ("app_first", "storage_first"):
+        if order == "app_first":
+            imports = "import app.storage.db as A\nimport storage.db as B\n"
+        else:
+            imports = "import storage.db as B\nimport app.storage.db as A\n"
+        code = (
+            "import sys; sys.path.insert(0, '.'); sys.path.insert(0, 'app')\n"
+            + imports
+            + "assert A is B, '模块对象未归一'\n"
+            + "assert A.get_conn() is B.get_conn(), '连接未归一'\n"
+            + "import app.storage as PA, storage as PB\n"
+            + "assert PA is PB, '包对象未归一'\n"
+            + "print('ALIAS_OK')\n"
+        )
+        r = sp.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(ROOT))
+        assert "ALIAS_OK" in (r.stdout or ""), \
+            f"[{order}] 失败: stdout={r.stdout!r} stderr={r.stderr[-400:]!r}"
+    print("[ok] E. 双名归一：app.storage.db 与 storage.db 在同一进程内为同一模块/同一连接（两种 import 顺序）")
+
+
 def main():
     print(f"[tmp SCAI_APP_DIR] {tmp}")
     test_cron_parsing()
@@ -227,6 +255,7 @@ def main():
     test_ensure_and_runner_logs(backend)
     test_machine_timeout_fix()
     test_patch_order_fix()
+    test_single_connection_alias()
 
     # 收尾：关掉 APScheduler
     if SC._APS_SCHED is not None:
