@@ -398,320 +398,273 @@ def export_csv(target_path: Path | None = None) -> Path:
     return target_path
 
 
-# ============== PyQt6 GUI（只有 3 个控件：搜索栏 + 表格 + 按钮条） ==============
+# ============== PyQt6 + QWebEngine 网页版控制台（与主程序同一套桥接架构） ==============
+#
+# 架构与 app/main.py 完全一致：
+#   admin_console.html  界面展示（视觉基准）
+#   AdminBridge         业务桥接（QWebChannel 暴露给 JS，action 分发到上面的 core 层函数）
+#   AdminConsoleWindow  窗口装配（QWebEngineView + QWebChannel + 无缓存 profile）
+# 打包：PyInstaller 入口仍是本文件；admin_console.html / avatar_icon.ico 由 spec 的 datas 带入。
+import ctypes
+import time as _time
+
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl
+from PyQt6.QtGui import QDesktopServices, QGuiApplication, QIcon
+from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PyQt6.QtWebChannel import QWebChannel
+
+_HTML_NAME = "admin_console.html"
+_ICON_NAME = "avatar_icon.ico"
+
+
+def resource_path(relative_path: str) -> Path:
+    """PyInstaller onefile/onedir 通用资源路径（与 main.py 同款）。"""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative_path
+
+
+class AdminBridge(QObject):
+    """管理员控制台 Python 端桥接对象，通过 QWebChannel 暴露为 JS 的 `bridge`。
+
+    JS → Python：window.pyqtBridge.call(action, payloadJson) → 本类 call() 槽
+    Python → JS：pong（call 结果）/ push（主动推送）
+    所有业务都走 core 层函数（create_license / revoke_license / list_licenses / stats …），
+    与 tests/test_admin_console_core.py 覆盖的是同一层，桥接只做参数透传与错误包装。
+    """
+
+    pong = pyqtSignal(str)          # 回传 call 结果（JSON 字符串）
+    push = pyqtSignal(str, str)     # 主动推送 (action, payload_json)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._window = None
+
+    def set_parent_window(self, window):
+        """设置主窗口引用（QFileDialog 的 parent）。"""
+        self._window = window
+
+    # ---------- JS → Python 入口 ----------
+    @pyqtSlot(str, str)
+    def call(self, action: str, payload_json: str):
+        try:
+            payload = json.loads(payload_json) if payload_json else {}
+        except json.JSONDecodeError:
+            payload = {}
+
+        print(f"[AdminBridge] JS→Python: action={action}, payload={payload}", flush=True)
+
+        handler = getattr(self, f"_handle_{action}", None)
+        if handler is None:
+            self.pong.emit(json.dumps(
+                {"ok": False, "action": action, "error": f"未知操作: {action}"}, ensure_ascii=False))
+            return
+
+        try:
+            data = handler(payload)
+            result = {"ok": True, "action": action, "data": data}
+            print(f"[AdminBridge] action={action} → ok", flush=True)
+        except ValueError as e:  # 业务拦截（重复机器码 / 边界校验）原样回给前端弹提示
+            result = {"ok": False, "action": action, "error": str(e)}
+            print(f"[AdminBridge] action={action} 拒绝: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            result = {"ok": False, "action": action, "error": f"{type(e).__name__}: {e}"}
+            print(f"[AdminBridge] action={action} 异常: {e}", flush=True)
+
+        self.pong.emit(json.dumps(result, ensure_ascii=False))
+
+    def send_to_js(self, action: str, payload: dict):
+        """Python 主动推送消息到 JS。"""
+        self.push.emit(action, json.dumps(payload, ensure_ascii=False))
+
+    def bootstrap_payload(self) -> dict:
+        """JS 桥接就绪时推送的首包。"""
+        return {"status": "Admin bridge connected", **self._handle_ready({})}
+
+    # ---------- 桥接测试 ----------
+    def _handle_ping(self, payload):
+        return {"message": "pong", "echo": payload, "server_ts": now_ts()}
+
+    def _handle_ready(self, payload):
+        """首包：数据目录信息 + 来源字典 + 初始统计。"""
+        home = get_admin_home()
+        return {
+            "db_path": str(get_admin_db_path()),
+            "admin_home": str(home),
+            "output_dir": str(home / _OUTPUT_DIRNAME),
+            "backup_dir": str(home / _BACKUP_DIRNAME),
+            "export_dir": str(home / _EXPORT_DIRNAME),
+            "sources": [{"value": v, "label": label} for v, label in SOURCE_OPTIONS],
+            "status_labels": {"active": "✅ 生效中", "revoked": "🚫 已作废", "pending_issued": "⏳ 待发布"},
+            "stats": stats(),
+        }
+
+    def _handle_list_licenses(self, payload):
+        rows = list_licenses(
+            keyword=(payload.get("keyword") or "").strip(),
+            status=(payload.get("status") or "").strip(),
+        )
+        return {"rows": rows, "stats": stats()}
+
+    def _handle_create_license(self, payload):
+        rec, out_path = create_license(
+            machine_code=payload.get("machine_code", ""),
+            user_tag=payload.get("user_tag", ""),
+            source=payload.get("source", "private_transfer"),
+            payment_ref=payload.get("payment_ref", ""),
+            amount_cents=int(payload.get("amount_cents") or 0),
+            notes=payload.get("notes", ""),
+        )
+        # 自动复制 .lic 绝对路径到剪贴板 + 在资源管理器中选中，方便直接拖给用户
+        try:
+            cb = QApplication.clipboard()
+            if cb is not None:
+                cb.setText(str(out_path))
+        except Exception:
+            pass
+        try:
+            import subprocess
+            subprocess.Popen(f'explorer /select,"{out_path}"')
+        except Exception:
+            pass
+        return {"record": rec, "out_path": str(out_path), "license_key": rec["license_key"]}
+
+    def _handle_revoke_license(self, payload):
+        rec = revoke_license(int(payload.get("license_id") or 0), reason=payload.get("reason", ""))
+        return {"record": rec, "stats": stats()}
+
+    def _handle_export_csv(self, payload):
+        out = export_csv()
+        saved = ""
+        # 可选：让管理员另存一份到桌面发会计（QFileDialog 必须在主线程，桥接槽本就在主线程）
+        if payload.get("ask_save") and self._window is not None:
+            default = str(Path.home() / "Desktop" / out.name)
+            chosen, _ = QFileDialog.getSaveFileName(
+                self._window, "另存到…（发给会计 / 自己对账放一份）", default, "CSV 表格 (*.csv)")
+            if chosen:
+                shutil.copy2(out, chosen)
+                saved = chosen
+        return {"path": str(out), "saved": saved}
+
+    def _handle_backup_db(self, payload):
+        _backup_db()
+        return {"backup_dir": str(get_admin_home() / _BACKUP_DIRNAME)}
+
+    def _handle_open_folder(self, payload):
+        which = payload.get("which") or "output"
+        sub = {"output": _OUTPUT_DIRNAME, "backup": _BACKUP_DIRNAME, "export": _EXPORT_DIRNAME, "home": ""}
+        target = get_admin_home() / sub.get(which, "")
+        try:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            return {"path": str(target), "error": str(e)}
+        return {"path": str(target)}
+
+
+class AdminPage(QWebEnginePage):
+    """自定义 WebEngine Page：挂载 QWebChannel 桥接 + 捕获 JS 控制台日志。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.bridge = AdminBridge()
+        self.channel = QWebChannel()
+        self.channel.registerObject("bridge", self.bridge)
+        self.setWebChannel(self.channel)
+
+    def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame: bool):
+        """拦截主框架的 http/https 外链，交给系统浏览器打开；本地资源放行。"""
+        if not is_main_frame:
+            return True
+        if url.scheme() in ("http", "https") and url.isValid():
+            QDesktopServices.openUrl(url)
+            return False
+        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+    def javaScriptConsoleMessage(self, level, message, line_number, source_id):
+        try:
+            level_val = int(level) if isinstance(level, int) else getattr(level, "value", 0)
+        except Exception:
+            level_val = 0
+        prefix = {0: "LOG", 1: "WARN", 2: "ERROR"}.get(level_val, "LOG")
+        src = source_id.split("/")[-1] if source_id else "?"
+        print(f"[Admin JS {prefix}] L{line_number} @ {src} : {message}", flush=True)
+
+
+class AdminConsoleWindow(QMainWindow):
+    """授权管家主窗口。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("阿维达 · 授权管家（管理员本地控制台）")
+
+        # 按屏幕分辨率自适应，封顶到设计尺寸
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        self.resize(min(int(screen.width() * 0.86), 1280), min(int(screen.height() * 0.86), 860))
+        self.setMinimumSize(960, 620)
+
+        self.browser = QWebEngineView()
+        self.setCentralWidget(self.browser)
+
+        try:
+            dpi = QGuiApplication.primaryScreen().logicalDotsPerInch()
+            self.browser.setZoomFactor(min(max(dpi / 96.0, 0.8), 1.5))
+        except Exception:
+            pass
+
+        # 禁用 HTTP 缓存，确保每次加载最新资源
+        profile = self.browser.page().profile()
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.NoCache)
+
+        self.page = AdminPage(self.browser)
+        self.browser.setPage(self.page)
+        self.page.bridge.set_parent_window(self)
+
+        html_path = resource_path(_HTML_NAME)
+        url = QUrl.fromLocalFile(str(html_path))
+        url.setQuery(f"t={int(_time.time())}")  # 附加时间戳，避开缓存
+        self.browser.setUrl(url)
+        self.browser.loadFinished.connect(self._on_load_finished)
+
+    def _on_load_finished(self, ok: bool):
+        if ok:
+            print("[Admin] HTML 加载完成，桥接就绪", flush=True)
+            self.page.bridge.send_to_js("ready", self.page.bridge.bootstrap_payload())
+        else:
+            print("[Admin] HTML 加载失败", flush=True)
+
+
 def _run_gui() -> int:
-    from PyQt6.QtCore import Qt, QTimer
-    from PyQt6.QtGui import QAction, QClipboard, QIcon
-    from PyQt6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
-        QMessageBox, QDialog, QFormLayout, QComboBox, QPlainTextEdit,
-        QDialogButtonBox, QLabel, QSpinBox, QFileDialog, QStatusBar,
-        QAbstractItemView,
+    from logger import setup_file_logging
+    setup_file_logging()
+
+    # OpenGL / Chromium 开关与 main.py 一致（虚拟机 / 无显卡环境可用）；
+    # 调试端口用 9223，避免与主程序 9222 冲突。
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+    os.environ.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        "--disable-gpu --disable-gpu-compositing --in-process-gpu"
+        " --no-sandbox --enable-features=NetworkServiceInProcess"
+        " --remote-debugging-port=9223",
     )
+
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AvatarAI.Admin.1.0")
 
     app = QApplication(sys.argv)
     app.setApplicationName("阿维达授权管家")
+    app.setApplicationDisplayName("阿维达授权管家")
 
-    win = QMainWindow()
-    win.setWindowTitle("阿维达授权管家 · 管理员本地控制台 v1.0")
-    win.resize(1080, 680)
+    icon_path = resource_path(_ICON_NAME)
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
-    central = QWidget(win); win.setCentralWidget(central)
-    root = QVBoxLayout(central); root.setContentsMargins(16, 16, 16, 12); root.setSpacing(10)
-
-    # 顶部：搜索栏 + 按钮条（一行）
-    top_row = QHBoxLayout(); top_row.setSpacing(8)
-    search_edit = QLineEdit(); search_edit.setPlaceholderText("🔍 搜：昵称 / 机器码 / 激活码 / 打款单号 / 备注")
-    btn_search = QPushButton("搜索")
-    btn_add = QPushButton("➕ 新增授权")
-    btn_revoke = QPushButton("❌ 作废选中")
-    btn_export = QPushButton("📤 导出 Excel(CSV)")
-    btn_folder = QPushButton("📁 打开授权文件目录")
-    for b in (btn_add, btn_revoke, btn_export, btn_folder):
-        b.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn_add.setStyleSheet("background:#1f6feb;color:#fff;padding:8px 14px;border-radius:6px;font-weight:600;")
-    btn_revoke.setStyleSheet("background:#cf222e;color:#fff;padding:8px 14px;border-radius:6px;")
-    btn_folder.setStyleSheet("padding:8px 12px;border-radius:6px;")
-    top_row.addWidget(search_edit, 3)
-    top_row.addWidget(btn_search, 1)
-    top_row.addStretch(1)
-    top_row.addWidget(btn_add); top_row.addWidget(btn_revoke); top_row.addWidget(btn_export); top_row.addWidget(btn_folder)
-    root.addLayout(top_row)
-
-    # 表格
-    cols = ["创建日期", "用户标识", "机器码(后8位)", "来源", "金额", "状态", "打款单号(后6)", "备注(前20字)"]
-    table = QTableWidget(0, len(cols)); table.setHorizontalHeaderLabels(cols)
-    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-    table.verticalHeader().setVisible(False)
-    h = table.horizontalHeader()
-    widths = [140, 180, 120, 150, 80, 80, 130]
-    for i, w in enumerate(widths):
-        h.resizeSection(i, w)
-    h.setSectionResizeMode(len(cols)-1, QHeaderView.ResizeMode.Stretch)
-    table.setAlternatingRowColors(True)
-    table.setStyleSheet("""
-        QTableWidget { gridline-color:#e6e8eb; }
-        QHeaderView::section { background:#f5f7fa; padding:8px; border:0; border-bottom:1px solid #e6e8eb; font-weight:600; }
-        QTableWidget::item { padding:6px 8px; }
-    """)
-    table.setProperty("row_id_map", {})  # row index → db id
-    root.addWidget(table, 1)
-
-    # 状态条
-    bar = QStatusBar(); win.setStatusBar(bar)
-    summary_label = QLabel(""); bar.addWidget(summary_label, 1)
-    path_label = QLabel(""); bar.addPermanentWidget(path_label)
-
-    SOURCE_LABEL_MAP = {k: v for k, v in SOURCE_OPTIONS}
-    STATUS_LABEL = {"active": "✅ 生效中", "revoked": "🚫 已作废", "pending_issued": "⏳ 待发布"}
-
-    def _refresh_summary():
-        s = stats()
-        rev = s["this_month_rev_cents"] / 100
-        total_rev = s["total_rev_cents"] / 100
-        manual_ratio = (s["manual_count"] / s["total_active"] * 100) if s["total_active"] else 0
-        summary_label.setText(
-            f"📊 本月：{s['this_month_count']} 笔 · 收入 ¥{rev:,.2f}   "
-            f"🏦 累计：{s['total_active']} 生效 / {s['total_revoked']} 作废 · ¥{total_rev:,.2f}   "
-            f"🔧 人工兜底占比：{manual_ratio:.0f}%（{s['manual_count']}/{s['total_active']}）"
-        )
-        path_label.setText(f"🗄 DB: {s['db_path']}")
-
-    def _refresh_table():
-        kw = search_edit.text().strip()
-        rows = list_licenses(keyword=kw)
-        table.setRowCount(len(rows))
-        id_map: dict[int, int] = {}
-        for i, r in enumerate(rows):
-            id_map[i] = int(r["id"])
-            def mk(text: str, is_red=False):
-                item = QTableWidgetItem(str(text))
-                if is_red:
-                    item.setForeground(Qt.GlobalColor.darkRed)
-                return item
-            created_s = datetime.fromtimestamp(int(r["created_at"])).strftime("%Y-%m-%d %H:%M") if r["created_at"] else ""
-            mc = (r["machine_code"] or "")
-            mc_show = mc[-8:] if len(mc) >= 8 else mc
-            source_show = SOURCE_LABEL_MAP.get(r["source"], r["source"])
-            amount = f"¥{int(r['amount_cents'] or 0)/100:.2f}"
-            status = STATUS_LABEL.get(r["status"], r["status"])
-            pr = (r["payment_ref"] or "")
-            pr_show = pr[-6:] if len(pr) >= 6 else pr
-            note = (r["notes"] or "").replace("\n", " ")
-            note_show = (note[:17] + "…") if len(note) > 20 else note
-            is_revoked = r["status"] == "revoked"
-            vals = [created_s, r["user_tag"] or "", mc_show, source_show, amount, status, pr_show, note_show]
-            for j, v in enumerate(vals):
-                item = mk(v, is_red=is_revoked)
-                if j == 5 and not is_revoked:
-                    item.setForeground(Qt.GlobalColor.darkGreen)
-                table.setItem(i, j, item)
-        table.setProperty("row_id_map", id_map)
-        _refresh_summary()
-
-    def _selected_db_id() -> int | None:
-        r = table.currentRow()
-        if r < 0:
-            return None
-        return int(table.property("row_id_map").get(r, 0)) or None
-
-    # -------- 新增授权对话框 --------
-    def _do_add():
-        dlg = QDialog(win); dlg.setWindowTitle("➕ 新增授权 · 生成 .lic 文件")
-        dlg.resize(520, 480)
-        form = QFormLayout(dlg); form.setContentsMargins(20, 20, 20, 14); form.setSpacing(10)
-
-        mc_edit = QLineEdit(); mc_edit.setPlaceholderText("A1B2-C3D4-E5F6-G7H8（用户发给你的机器码）")
-        user_edit = QLineEdit(); user_edit.setPlaceholderText("昵称 / 微信ID / QQ（方便后续查）")
-        src_combo = QComboBox()
-        for v, label in SOURCE_OPTIONS:
-            src_combo.addItem(label, v)
-        src_combo.setCurrentIndex(1)  # 默认「虎皮椒补单」（人工兜底最高频的场景）
-        ref_edit = QLineEdit(); ref_edit.setPlaceholderText("虎皮椒单号 / 微信/支付宝交易单号（对账用）")
-        amount_spin = QSpinBox(); amount_spin.setRange(0, 999_000_00); amount_spin.setValue(29900)
-        amount_spin.setSingleStep(100); amount_spin.setSuffix(" 分")  # 100 分 = 1 元
-        amount_label = QLabel("＝ ¥0.00")
-        def _sync_amt(v): amount_label.setText(f"＝ ¥{v/100:.2f}")
-        amount_spin.valueChanged.connect(_sync_amt); _sync_amt(amount_spin.value())
-        amt_row = QHBoxLayout(); amt_row.addWidget(amount_spin, 1); amt_row.addWidget(amount_label)
-        amt_wrap = QWidget(); l = QVBoxLayout(amt_wrap); l.setContentsMargins(0,0,0,0); l.addLayout(amt_row)
-
-        notes_edit = QPlainTextEdit(); notes_edit.setPlaceholderText("换电脑说明 / 赠码原因 / 投诉 / 倒卖封禁记录等，留空可")
-        notes_edit.setFixedHeight(90)
-
-        hint = QLabel("💡 同一台机器码不能重复生成「生效中」记录，会弹拦截。若确实是补码，请先作废旧记录。")
-        hint.setStyleSheet("color:#92400e;background:#fffbe8;border:1px solid #fde68a;border-radius:6px;padding:8px 10px;")
-        hint.setWordWrap(True)
-
-        form.addRow("🔑 机器码 *", mc_edit)
-        form.addRow("👤 用户标识", user_edit)
-        form.addRow("🧾 来源 *", src_combo)
-        form.addRow("💰 打款单号", ref_edit)
-        form.addRow("🏷 实收金额 *", amt_wrap)
-        form.addRow("📝 备注", notes_edit)
-        form.addRow(hint)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Ok).setText("✅ 确认生成 .lic 文件")
-        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        form.addRow(bb)
-
-        def _ok():
-            try:
-                rec, out_path = create_license(
-                    machine_code=mc_edit.text(),
-                    user_tag=user_edit.text(),
-                    source=src_combo.currentData(),
-                    payment_ref=ref_edit.text(),
-                    amount_cents=int(amount_spin.value()),
-                    notes=notes_edit.toPlainText(),
-                )
-            except ValueError as e:
-                QMessageBox.warning(dlg, "参数/拦截", str(e))
-                return
-            except Exception as e:  # noqa: BLE001
-                QMessageBox.critical(dlg, "生成失败", f"{type(e).__name__}: {e}")
-                return
-            QMessageBox.information(
-                dlg, "✅ 生成成功",
-                f"记录 ID #{rec['id']} 已入库并备份。\n\n"
-                f"🔑 激活码：{rec['license_key']}（已自动复制到剪贴板）\n"
-                f"📄 授权文件：{out_path}\n\n"
-                f"下一步：把这个 .lic 文件 QQ/微信 拖给用户，并告诉他 MVP → 激活弹窗 Tab2 → "
-                f"【导入授权文件】选一下就行，1 秒生效。"
-            )
-            # 自动复制 .lic 文件绝对路径 + 激活码到剪贴板（方便用户二次粘贴给微信）
-            cb: QClipboard | None = app.clipboard()
-            if cb is not None:
-                cb.setText(str(out_path))
-            # 顺带打开文件所在文件夹并选中 .lic（Windows 资源管理器）
-            try:
-                import subprocess
-                subprocess.Popen(f'explorer /select,"{out_path}"')
-            except Exception:
-                pass
-            dlg.accept()
-
-        bb.accepted.connect(_ok)
-        bb.rejected.connect(dlg.reject)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            _refresh_table()
-
-    # -------- 作废对话框 --------
-    def _do_revoke():
-        lid = _selected_db_id()
-        if not lid:
-            QMessageBox.information(win, "提示", "请先在列表里选中一行要作废的授权记录。")
-            return
-        row = row_to_dict(get_admin_conn().execute("SELECT * FROM admin_licenses WHERE id=?", (lid,)).fetchone())
-        if not row:
-            return
-        dlg = QDialog(win); dlg.setWindowTitle("❌ 作废选中授权")
-        dlg.resize(480, 260)
-        f = QFormLayout(dlg); f.setContentsMargins(20, 20, 20, 14); f.setSpacing(10)
-        info = QLabel(
-            f"确认要作废以下授权？\n\n"
-            f"  记录ID：#{row['id']}\n"
-            f"  用户：{row['user_tag'] or '(未填)'}\n"
-            f"  机器码：{row['machine_code']}\n"
-            f"  激活码：{row['license_key']}\n"
-            f"  来源：{SOURCE_LABEL_MAP.get(row['source'], row['source'])}\n"
-            f"  创建时间：{datetime.fromtimestamp(int(row['created_at'])):%Y-%m-%d %H:%M:%S}"
-        )
-        info.setStyleSheet("background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;padding:10px 12px;")
-        info.setWordWrap(True)
-        reason = QLineEdit(); reason.setPlaceholderText("作废原因：如 换电脑 / 退款 / 倒卖封禁 等")
-        f.addRow(info)
-        f.addRow("📝 作废原因", reason)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Ok).setText("确定作废")
-        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        f.addRow(bb)
-
-        def _ok():
-            try:
-                revoke_license(lid, reason=reason.text())
-            except ValueError as e:
-                QMessageBox.warning(dlg, "作废失败", str(e)); return
-            except Exception as e:  # noqa: BLE001
-                QMessageBox.critical(dlg, "作废失败", f"{type(e).__name__}: {e}"); return
-            dlg.accept()
-        bb.accepted.connect(_ok); bb.rejected.connect(dlg.reject)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            QMessageBox.information(win, "已作废", "选中的授权已作废，并自动做了一份 DB 备份。")
-            _refresh_table()
-
-    # -------- 导出 CSV --------
-    def _do_export():
-        try:
-            out = export_csv()
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(win, "导出失败", f"{type(e).__name__}: {e}"); return
-        # 让管理员再自选一个位置另存（方便直接放到桌面发给会计）
-        default = str(Path.home() / "Desktop" / out.name)
-        chosen, _ = QFileDialog.getSaveFileName(
-            win, "另存到...（发给会计 / 自己对账放一份）", default, "CSV 表格 (*.csv)"
-        )
-        if chosen:
-            try:
-                shutil.copy2(out, chosen)
-            except Exception as e:  # noqa: BLE001
-                QMessageBox.warning(win, "另存失败", str(e))
-                return
-        QMessageBox.information(
-            win, "✅ 导出完成",
-            f"已导出全量账本：\n{out}\n\n可以用 Excel / WPS / 飞书多维表格 打开，utf-8 带 BOM，中文直接显示。\n"
-            f"对账提示：本月收款合计（¥）− 虎皮椒后台收入合计 × 0.98 ≈ 0，差额大就是漏记或多记。"
-        )
-
-    def _do_open_folder():
-        p = get_admin_home() / _OUTPUT_DIRNAME
-        try:
-            os.startfile(str(p))  # type: ignore[attr-defined]
-        except Exception:
-            QMessageBox.information(win, "目录", str(p))
-
-    # 连接信号
-    search_edit.returnPressed.connect(_refresh_table)
-    btn_search.clicked.connect(_refresh_table)
-    btn_add.clicked.connect(_do_add)
-    btn_revoke.clicked.connect(_do_revoke)
-    btn_export.clicked.connect(_do_export)
-    btn_folder.clicked.connect(_do_open_folder)
-
-    _refresh_table()
-    # 每 60 秒自动刷新（防止另一处改了 DB 主窗口没反应；MVP 阶段管理员单机其实不需要，但顺手做了）
-    t = QTimer(win); t.setInterval(60_000); t.timeout.connect(_refresh_table); t.start()
-
-    # 菜单栏：快速导出/备份/关于
-    menu = win.menuBar()
-    act = menu.addMenu("⚙ 操作")
-    a_export = QAction("📤 导出 CSV 对账", win); a_export.triggered.connect(_do_export); act.addAction(a_export)
-    a_backup = QAction("💾 立即备份 DB（手动触发一份）", win)
-    def _man_backup(): _backup_db(); QMessageBox.information(win, "备份完成", f"已备份到：{get_admin_home() / _BACKUP_DIRNAME}")
-    a_backup.triggered.connect(_man_backup); act.addAction(a_backup)
-    a_open_home = QAction("📂 打开管理员 Home 目录", win)
-    def _open_home(): os.startfile(str(get_admin_home()))  # type: ignore[attr-defined]
-    a_open_home.triggered.connect(_open_home); act.addAction(a_open_home)
-    help_ = menu.addMenu("ℹ 帮助")
-    a_about = QAction("关于", win)
-    a_about.triggered.connect(lambda: QMessageBox.information(
-        win, "关于",
-        "阿维达授权管家 v1.0\n\n"
-        "用途：管理员本机运营兜底激活（场景 A 虎皮椒补单 / 场景 B 私人转账）。\n"
-        "账本文件：SQLite 单文件，每次写操作自动日期级备份，可放 OneDrive 同步。\n"
-        "账本与用户端 MVP activation 共享同一套 HMAC 算法，生成的 .lic 文件可直接被 MVP 导入识别。",
-    ))
-    help_.addAction(a_about)
-
-    win.show()
+    window = AdminConsoleWindow()
+    window.show()
     return app.exec()
 
 
 if __name__ == "__main__":
-    # 写之前初始化一次 DB 连接，保证表结构就绪（GUI 启动后任何一个 action 其实也会自动触发）
-    _ = get_admin_conn()
+    _ = get_admin_conn()  # 确保表结构就绪（GUI 启动后任一 action 也会触发）
     sys.exit(_run_gui())

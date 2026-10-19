@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+
+<head>
+<meta charset="UTF-8">
+<title>阿维达 · 授权管家</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+/* ============================================================
+   阿维达 · 授权管家（管理员本地控制台）
+   设计语言与 app/web/index.html 全局设计系统保持一致：
+   深色底 + 绿色 accent + 8/12/16 圆角 + 玻璃拟态边框
+   ============================================================ */
+:root {
+  --bg-void: #06080F;
+  --bg-base: #0B0F1E;
+  --bg-elevated: #11172A;
+  --bg-soft: #121830;
+  --bg-glass: rgba(255, 255, 255, 0.025);
+  --bg-glass-hover: rgba(255, 255, 255, 0.045);
+  --border: rgba(255, 255, 255, 0.10);
+  --border-light: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 22px;
+
+  --text-primary: #F1F5F9;
+  --text-secondary: #94A3B8;
+  --text-tertiary: #64748B;
+
+  --accent: #10B981;
+  --accent-light: #34D399;
+  --accent-dim: rgba(16, 185, 129, 0.12);
+  --accent-soft: rgba(16, 185, 129, 0.08);
+  --accent-line: rgba(16, 185, 129, 0.4);
+
+  --warning: #F59E0B;
+  --warning-light: #FBBF24;
+  --warning-dim: rgba(245, 158, 11, 0.12);
+
+  --danger: #F43F5E;
+  --danger-light: #FB7185;
+  --danger-dim: rgba(244, 63, 94, 0.12);
+
+  --font: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: var(--fs-base);
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, rgba(16,185,129,0.06), transparent 60%),
+    radial-gradient(900px 500px at 100% 110%, rgba(59,130,246,0.05), transparent 60%),
+    var(--bg-void);
+}
+
+::selection { background: var(--accent-dim); color: var(--accent-light); }
+
+/* ---------- 滚动条 ---------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.10); border-radius: 999px;
+  border: 2px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); background-clip: content-box; }
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  display: flex; align-items: center;
+  gap: 16px;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--border-light);
+  background: linear-gradient(180deg, var(--bg-base), var(--bg-void));
+  -webkit-app-region: drag;
+  flex: 0 0 auto;
+}
+.topbar .brand {
+  display: flex; align-items: center; gap: 10px;
+  font-size: var(--fs-lg); font-weight: 600; letter-spacing: .3px;
+  white-space: nowrap;
+}
+.brand-mark {
+  width: 26px; height: 26px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  box-shadow: 0 0 16px var(--accent-soft);
+  display: grid; place-items: center; font-size: 15px; color: #04120C; font-weight: 700;
+}
+.brand .ver {
+  font-size: var(--fs-xs); font-weight: 500; color: var(--accent);
+  background: var(--accent-soft); border: 1px solid var(--accent-line);
+  padding: 1px 7px; border-radius: 999px; margin-left: 2px;
+}
+.topbar .sub { color: var(--text-tertiary); font-size: var(--fs-sm); }
+.topbar .spacer { flex: 1; }
+.topbar .db-path {
+  font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-tertiary);
+  max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+/* ---------- 按钮 ---------- */
+button {
+  font-family: var(--font); font-size: var(--fs-base);
+  color: var(--text-primary); background: var(--bg-glass);
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  padding: 7px 13px; cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s, transform .08s;
+  -webkit-app-region: no-drag;
+  white-space: nowrap;
+}
+button:hover { background: var(--bg-glass-hover); border-color: var(--border-strong); }
+button:active { transform: translateY(1px); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.primary {
+  background: var(--accent); border-color: var(--accent); color: #04120C;
+  font-weight: 600; box-shadow: 0 2px 12px var(--accent-soft);
+}
+button.primary:hover { background: var(--accent-light); border-color: var(--accent-light); }
+button.danger { color: var(--danger-light); border-color: rgba(244,63,94,.35); background: var(--danger-dim); }
+button.danger:hover { background: rgba(244,63,94,.20); border-color: var(--danger); }
+button.ghost { background: transparent; }
+
+/* ---------- 统计卡 ---------- */
+.stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  padding: 14px 22px 4px;
+  flex: 0 0 auto;
+}
+.stat {
+  background: var(--bg-glass); border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg); padding: 12px 16px;
+  backdrop-filter: blur(8px);
+}
+.stat .k { font-size: var(--fs-xs); color: var(--text-tertiary); letter-spacing: .5px; }
+.stat .v { font-size: var(--fs-xl); font-weight: 600; margin-top: 4px; }
+.stat .v small { font-size: var(--fs-sm); font-weight: 400; color: var(--text-secondary); margin-left: 4px; }
+.stat.accent .v { color: var(--accent); }
+.stat.money .v { color: var(--accent-light); }
+.stat.danger .v { color: var(--danger-light); }
+
+/* ---------- 工具条 ---------- */
+.toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 22px;
+  flex: 0 0 auto;
+}
+input[type="text"], input[type="number"], select, textarea {
+  font-family: var(--font); font-size: var(--fs-base); color: var(--text-primary);
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: var(--radius-md); padding: 8px 12px; outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+input::placeholder, textarea::placeholder { color: var(--text-tertiary); }
+#search { flex: 1; min-width: 220px; }
+select { cursor: pointer; -webkit-appearance: none; padding-right: 30px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-tertiary) 50%),
+                    linear-gradient(135deg, var(--text-tertiary) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 52%, calc(100% - 11px) 52%;
+  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+}
+
+/* ---------- 表格 ---------- */
+.tablewrap {
+  flex: 1 1 auto; overflow: hidden auto;
+  margin: 0 22px 0; border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg); background: var(--bg-glass);
+  position: relative;
+}
+table { width: 100%; border-collapse: collapse; font-size: var(--fs-base); }
+thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg-elevated);
+  color: var(--text-secondary); font-weight: 600; font-size: var(--fs-xs);
+  letter-spacing: .4px; text-align: left;
+  padding: 11px 14px; border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+tbody tr { border-bottom: 1px solid var(--border-light); cursor: pointer; transition: background .12s; }
+tbody tr:hover { background: var(--bg-glass-hover); }
+tbody tr.selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+tbody tr.revoked { opacity: .55; }
+tbody tr.revoked td { text-decoration: line-through; text-decoration-color: rgba(148,163,184,.4); }
+tbody td { padding: 10px 14px; color: var(--text-primary); white-space: nowrap; }
+tbody td.mc, tbody td.key { font-family: var(--mono); font-size: var(--fs-sm); color: var(--text-secondary); }
+tbody td.note { max-width: 260px; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); }
+tbody td.amount { font-family: var(--mono); color: var(--accent-light); }
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: var(--fs-xs); font-weight: 500;
+  padding: 2px 9px; border-radius: 999px; border: 1px solid transparent;
+}
+.badge.active { color: var(--accent-light); background: var(--accent-dim); border-color: var(--accent-line); }
+.badge.revoked { color: var(--danger-light); background: var(--danger-dim); border-color: rgba(244,63,94,.35); }
+.badge.pending { color: var(--warning-light); background: var(--warning-dim); border-color: rgba(245,158,11,.4); }
+
+.empty {
+  position: absolute; inset: 0; display: none;
+  flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; color: var(--text-tertiary); font-size: var(--fs-md);
+}
+.empty.show { display: flex; }
+.empty .big { font-size: 40px; opacity: .35; }
+
+/* ---------- 底部状态条 ---------- */
+.statusbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 16px;
+  padding: 9px 22px; border-top: 1px solid var(--border-light);
+  color: var(--text-tertiary); font-size: var(--fs-sm);
+  background: var(--bg-base);
+}
+.statusbar .spacer { flex: 1; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+.dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+.dot.off { background: var(--danger); }
+
+/* ---------- 弹窗 ---------- */
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(3,5,11,0.72);
+  backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center;
+  z-index: 50; padding: 24px;
+}
+.modal-mask.show { display: flex; animation: fade .15s ease; }
+@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+.modal {
+  width: 560px; max-width: 100%; max-height: 90vh; overflow: auto;
+  background: var(--bg-elevated); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl); box-shadow: 0 24px 80px rgba(0,0,0,.6);
+  animation: pop .18s cubic-bezier(.2,.9,.3,1.2);
+}
+@keyframes pop { from { transform: scale(.96) translateY(8px); opacity: 0 } to { transform: none; opacity: 1 } }
+.modal header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 18px 22px; border-bottom: 1px solid var(--border-light);
+  font-size: var(--fs-lg); font-weight: 600;
+}
+.modal .body { padding: 20px 22px; display: flex; flex-direction: column; gap: 15px; }
+.modal footer {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 16px 22px; border-top: 1px solid var(--border-light);
+}
+.field { display: flex; flex-direction: column; gap: 7px; }
+.field > label { font-size: var(--fs-sm); color: var(--text-secondary); }
+.field .req { color: var(--danger-light); }
+.field .row2 { display: flex; gap: 10px; align-items: center; }
+.field .row2 input { flex: 1; }
+.field .hint { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.field .amt-eq { font-family: var(--mono); color: var(--accent-light); white-space: nowrap; }
+.note-box {
+  font-size: var(--fs-sm); line-height: 1.6; color: var(--text-secondary);
+  background: var(--bg-glass); border: 1px solid var(--border-light);
+  border-radius: var(--radius-md); padding: 10px 12px;
+}
+.note-box.warn { color: var(--warning-light); background: var(--warning-dim); border-color: rgba(245,158,11,.35); }
+textarea { resize: vertical; min-height: 76px; line-height: 1.5; }
+
+/* ---------- Toast ---------- */
+#toast {
+  position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-24px);
+  background: var(--bg-elevated); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md); padding: 12px 18px; font-size: var(--fs-md);
+  box-shadow: 0 12px 40px rgba(0,0,0,.5); opacity: 0; pointer-events: none;
+  transition: opacity .2s, transform .2s; z-index: 90; max-width: 70vw;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+#toast.ok { border-color: var(--accent-line); box-shadow: 0 12px 40px rgba(16,185,129,.18); }
+#toast.err { border-color: rgba(244,63,94,.5); box-shadow: 0 12px 40px rgba(244,63,94,.20); }
+</style>
+</head>
+
+<body>
+  <!-- ============ 顶栏 ============ -->
+  <div class="topbar">
+    <div class="brand">
+      <span class="brand-mark">A</span>
+      <span>阿维达 · 授权管家</span>
+      <span class="ver" id="verTag">v1.0</span>
+    </div>
+    <div class="db-path" id="dbPath" title="">数据目录加载中…</div>
+    <div class="spacer"></div>
+    <button class="ghost" id="btnRefresh">⟳ 刷新</button>
+    <button class="ghost" id="btnBackup">💾 立即备份</button>
+    <button class="ghost" id="btnHome">📂 数据目录</button>
+  </div>
+
+  <!-- ============ 统计卡 ============ -->
+  <div class="stats">
+    <div class="stat accent">
+      <div class="k">本月新增（生效）</div>
+      <div class="v" id="stMonth">—<small></small></div>
+    </div>
+    <div class="stat money">
+      <div class="k">本月收入</div>
+      <div class="v" id="stMonthRev">—</div>
+    </div>
+    <div class="stat money">
+      <div class="k">累计收入</div>
+      <div class="v" id="stTotalRev">—</div>
+    </div>
+    <div class="stat">
+      <div class="k">生效 / 作废 / 人工占比</div>
+      <div class="v" id="stMix">—</div>
+    </div>
+  </div>
+
+  <!-- ============ 工具条 ============ -->
+  <div class="toolbar">
+    <input type="text" id="search" placeholder="🔍 搜：昵称 / 机器码 / 激活码 / 打款单号 / 备注（回车即时搜）">
+    <select id="statusFilter">
+      <option value="">全部状态</option>
+      <option value="active">仅生效中</option>
+      <option value="revoked">仅已作废</option>
+      <option value="pending_issued">仅待发布</option>
+    </select>
+    <button class="primary" id="btnAdd">➕ 新增授权</button>
+    <button class="danger" id="btnRevoke">❌ 作废选中</button>
+    <button id="btnExport">📤 导出 CSV</button>
+    <button id="btnOutputDir">📁 授权文件目录</button>
+  </div>
+
+  <!-- ============ 表格 ============ -->
+  <div class="tablewrap">
+    <table id="licTable">
+      <thead>
+        <tr>
+          <th style="width:150px;">创建日期</th>
+          <th style="width:170px;">用户标识</th>
+          <th style="width:150px;">机器码（后8）</th>
+          <th style="width:180px;">来源</th>
+          <th style="width:96px;">金额</th>
+          <th style="width:96px;">状态</th>
+          <th style="width:130px;">打款单号（后6）</th>
+          <th>备注</th>
+        </tr>
+      </thead>
+      <tbody id="licBody"></tbody>
+    </table>
+    <div class="empty" id="emptyState">
+      <div class="big">🗂</div>
+      <div id="emptyText">暂无授权记录 —— 点「➕ 新增授权」生成第一份 .lic</div>
+    </div>
+  </div>
+
+  <!-- ============ 底部状态条 ============ -->
+  <div class="statusbar">
+    <span><span class="dot off" id="bridgeDot"></span><span id="bridgeState">桥接连接中…</span></span>
+    <span class="spacer"></span>
+    <span id="statusText">就绪</span>
+    <span id="countText"></span>
+  </div>
+
+  <!-- ============ 新增授权弹窗 ============ -->
+  <div class="modal-mask" id="addModal">
+    <div class="modal">
+      <header>➕ 新增授权 · 生成 .lic 文件</header>
+      <div class="body">
+        <div class="field">
+          <label>🔑 机器码 <span class="req">*</span></label>
+          <input type="text" id="fMachine" placeholder="A1B2-C3D4-E5F6-G7H8（用户发给你的机器码）">
+          <div class="hint">用户从「阿维达AI → 激活 → 获取机器码」复制给你，注意不要漏填横杠。</div>
+        </div>
+        <div class="field">
+          <label>👤 用户标识</label>
+          <input type="text" id="fUser" placeholder="昵称 / 微信ID / QQ（方便后续查账）">
+        </div>
+        <div class="field">
+          <label>🧾 来源 <span class="req">*</span></label>
+          <select id="fSource"></select>
+        </div>
+        <div class="field">
+          <label>💰 打款单号</label>
+          <input type="text" id="fRef" placeholder="虎皮椒单号 / 微信/支付宝交易单号（对账用）">
+        </div>
+        <div class="field">
+          <label>🏷 实收金额 <span class="req">*</span></label>
+          <div class="row2">
+            <input type="number" id="fAmount" value="29900" min="0" step="100">
+            <span class="hint">分</span>
+            <span class="amt-eq" id="fAmountEq">＝ ¥299.00</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>📝 备注</label>
+          <textarea id="fNotes" placeholder="换电脑说明 / 赠码原因 / 投诉 / 倒卖封禁记录等，留空可"></textarea>
+        </div>
+        <div class="note-box warn">
+          💡 同一台机器码不能重复生成「生效中」记录，会弹拦截。若确实是补码，请先选中旧记录 → 作废，再重新生成。
+        </div>
+      </div>
+      <footer>
+        <button class="ghost" data-close="addModal">取消</button>
+        <button class="primary" id="btnAddConfirm">✅ 确认生成 .lic</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- ============ 作废弹窗 ============ -->
+  <div class="modal-mask" id="revokeModal">
+    <div class="modal" style="width:480px;">
+      <header>❌ 作废选中授权</header>
+      <div class="body">
+        <div class="note-box" id="revokeInfo">—</div>
+        <div class="field">
+          <label>📝 作废原因</label>
+          <input type="text" id="fReason" placeholder="如 换电脑 / 退款 / 倒卖封禁 等">
+        </div>
+      </div>
+      <footer>
+        <button class="ghost" data-close="revokeModal">取消</button>
+        <button class="danger" id="btnRevokeConfirm">确定作废</button>
+      </footer>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+<!-- QWebChannel JS 桥接库（由 PyQt6 QtWebEngine 提供，qrc 协议内嵌） -->
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+<script>
+// ============================================================
+// Python Bridge Communication Layer (QWebChannel) —— 必须先初始化
+// JS → Python: window.pyqtBridge.call(action, payload)
+// Python → JS: bridge.pong（call 结果）/ bridge.push（主动推送）
+// ============================================================
+window.pyqtBridge = {
+  _callbacks: {},
+  _ready: false,
+  _pendingQueue: [],
+  _bridge: null,
+
+  call: function(action, payload) {
+    payload = payload || {};
+    if (this._bridge && this._ready) {
+      this._bridge.call(action, JSON.stringify(payload));
+    } else {
+      this._pendingQueue.push({ action: action, payload: payload });
+    }
+  },
+
+  _dispatch: function(data) {
+    const action = data && data.action;
+    const handler = this._callbacks[action];
+    if (handler) {
+      try { handler(data); } catch (e) { console.error('[Bridge] handler error', action, e); }
+    } else if (action && action !== 'ready') {
+      console.warn('[Bridge] 无 handler 注册:', action);
+    }
+    if (action === 'ready' && !this._ready) {
+      this._ready = true;
+      const queue = this._pendingQueue.slice();
+      this._pendingQueue = [];
+      queue.forEach(item => this.call(item.action, item.payload));
+      this.call('ping', { source: 'js', auto: true });
+    }
+  },
+
+  on: function(action, handler) {
+    this._callbacks[action] = handler;
+  }
+};
+
+(function initBridge() {
+  if (typeof qt === 'undefined' || !qt.webChannelTransport) {
+    console.log('[Bridge] qt.webChannelTransport 不可用（浏览器预览环境，桥接降级）');
+    return;
+  }
+  new QWebChannel(qt.webChannelTransport, function(channel) {
+    const bridge = channel.objects.bridge;
+    window.pyqtBridge._bridge = bridge;
+    bridge.pong.connect(function(jsonStr) {
+      let data;
+      try { data = JSON.parse(jsonStr); } catch (e) { data = { action: 'error', error: 'JSON 解析失败' }; }
+      window.pyqtBridge._dispatch(data);
+    });
+    bridge.push.connect(function(action, jsonStr) {
+      let payload;
+      try { payload = JSON.parse(jsonStr); } catch (e) { payload = {}; }
+      window.pyqtBridge._dispatch({ action: action, payload: payload, push: true });
+    });
+    console.log('[Bridge] QWebChannel 已建立，等待 Python ready 信号');
+  });
+})();
+
+// ============================================================
+// UI 层
+// ============================================================
+const $ = (id) => document.getElementById(id);
+
+const UI = {
+  meta: { sources: [], statusLabels: {}, db_path: '' },
+  rows: [],
+  selectedId: null,
+};
+
+function toast(msg, kind) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'show ' + (kind || '');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.className = ''; }, kind === 'err' ? 5200 : 3000);
+}
+
+function setStatus(text, count) {
+  $('statusText').textContent = text;
+  $('countText').textContent = count == null ? '' : count;
+}
+
+function setBridgeState(ok) {
+  $('bridgeDot').className = 'dot ' + (ok ? 'on' : 'off');
+  $('bridgeState').textContent = ok ? '桥接已连接' : '桥接断开';
+}
+
+function fmtDate(ts) {
+  if (!ts) return '';
+  const d = new Date(Number(ts) * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function fmtMoney(cents) {
+  return '¥' + (Number(cents || 0) / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function statusBadge(status) {
+  const label = UI.meta.statusLabels[status] || status;
+  const cls = status === 'active' ? 'active' : (status === 'revoked' ? 'revoked' : 'pending');
+  return `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
+}
+
+// ---------- 渲染 ----------
+function renderStats(st) {
+  if (!st) return;
+  $('stMonth').innerHTML = `${st.this_month_count}<small>笔</small>`;
+  $('stMonthRev').textContent = fmtMoney(st.this_month_rev_cents);
+  $('stTotalRev').textContent = fmtMoney(st.total_rev_cents);
+  const ratio = st.total_active ? Math.round(st.manual_count / st.total_active * 100) : 0;
+  $('stMix').innerHTML = `<span style="color:var(--accent-light)">${st.total_active}</span>`
+    + ` / <span style="color:var(--danger-light)">${st.total_revoked}</span>`
+    + `<small>人工 ${ratio}%（${st.manual_count}）</small>`;
+}
+
+function sourceLabel(key) {
+  const hit = UI.meta.sources.find((s) => s.value === key);
+  return hit ? hit.label : (key || '');
+}
+
+function renderRows(rows, stats) {
+  UI.rows = rows;
+  const body = $('licBody');
+  body.innerHTML = '';
+  rows.forEach((r) => {
+    const tr = document.createElement('tr');
+    tr.dataset.id = r.id;
+    if (r.status === 'revoked') tr.classList.add('revoked');
+    if (UI.selectedId && Number(UI.selectedId) === Number(r.id)) tr.classList.add('selected');
+    const mc = r.machine_code || '';
+    const pr = r.payment_ref || '';
+    tr.innerHTML =
+      `<td>${escapeHtml(fmtDate(r.created_at))}</td>` +
+      `<td>${escapeHtml(r.user_tag || '—')}</td>` +
+      `<td class="mc" title="${escapeHtml(mc)}">${escapeHtml(mc.slice(-8) || '—')}</td>` +
+      `<td>${escapeHtml(sourceLabel(r.source))}</td>` +
+      `<td class="amount">${fmtMoney(r.amount_cents)}</td>` +
+      `<td>${statusBadge(r.status)}</td>` +
+      `<td class="key" title="${escapeHtml(pr)}">${escapeHtml(pr.slice(-6) || '—')}</td>` +
+      `<td class="note" title="${escapeHtml(r.notes || '')}">${escapeHtml(r.notes || '')}</td>`;
+    tr.addEventListener('click', () => {
+      if (UI.selectedId === r.id) { UI.selectedId = null; }
+      else { UI.selectedId = r.id; }
+      renderRows(UI.rows);
+    });
+    body.appendChild(tr);
+  });
+  $('emptyState').classList.toggle('show', rows.length === 0);
+  $('btnRevoke').disabled = !UI.selectedId;
+  if (stats) renderStats(stats);
+  setStatus('已加载', `${rows.length} 条记录`);
+}
+
+// ---------- 调用 Python ----------
+function refresh() {
+  setStatus('查询中…');
+  stream('on');
+  window.pyqtBridge.call('list_licenses', {
+    keyword: $('search').value.trim(),
+    status: $('statusFilter').value,
+  });
+}
+
+// 本地选中行数据
+function selectedRow() {
+  return UI.rows.find((r) => Number(r.id) === Number(UI.selectedId)) || null;
+}
+
+// ---------- 新增授权 ----------
+function openAdd() {
+  $('fMachine').value = '';
+  $('fUser').value = '';
+  $('fRef').value = '';
+  $('fAmount').value = 29900;
+  $('fAmountEq').textContent = '＝ ¥299.00';
+  $('fNotes').value = '';
+  $('fSource').value = 'huqijiao_manual';
+  $('addModal').classList.add('show');
+  setTimeout(() => $('fMachine').focus(), 60);
+}
+
+function submitAdd() {
+  const machine = $('fMachine').value.trim();
+  if (!machine) { toast('请填写机器码', 'err'); $('fMachine').focus(); return; }
+  const payload = {
+    machine_code: machine,
+    user_tag: $('fUser').value,
+    source: $('fSource').value,
+    payment_ref: $('fRef').value,
+    amount_cents: parseInt($('fAmount').value || '0', 10),
+    notes: $('fNotes').value,
+  };
+  $('btnAddConfirm').disabled = true;
+  setStatus('生成中…');
+  stream('on');
+  window.pyqtBridge.call('create_license', payload);
+}
+
+// ---------- 作废 ----------
+function openRevoke() {
+  const r = selectedRow();
+  if (!r) { toast('请先在列表里选中一行要作废的记录', 'err'); return; }
+  $('revokeInfo').innerHTML =
+    `确认要作废以下授权？<br><br>` +
+    `记录 ID：<b>#${r.id}</b><br>` +
+    `用户：${escapeHtml(r.user_tag || '(未填)')}<br>` +
+    `机器码：<span style="font-family:var(--mono)">${escapeHtml(r.machine_code || '')}</span><br>` +
+    `激活码：<span style="font-family:var(--mono)">${escapeHtml(r.license_key || '')}</span><br>` +
+    `来源：${escapeHtml(sourceLabel(r.source))}<br>` +
+    `创建时间：${escapeHtml(fmtDate(r.created_at))}`;
+  $('fReason').value = '';
+  $('revokeModal').classList.add('show');
+  setTimeout(() => $('fReason').focus(), 60);
+}
+
+function submitRevoke() {
+  const r = selectedRow();
+  if (!r) { toast('未选中记录', 'err'); return; }
+  $('btnRevokeConfirm').disabled = true;
+  setStatus('作废中…');
+  window.pyqtBridge.call('revoke_license', { license_id: r.id, reason: $('fReason').value });
+}
+
+// ---------- Python 回包 ----------
+function stream(on) {
+  document.body.style.cursor = on ? 'progress' : '';
+}
+
+window.pyqtBridge.on('ready', function(data) {
+  setBridgeState(true);
+  // ready 同时兼容 push（payload 字段）与 pong（data 字段）
+  const info = (data && data.payload) ? data.payload : (data && data.data) ? data.data : data;
+  if (info && info.sources) {
+    UI.meta.sources = info.sources;
+    UI.meta.statusLabels = info.status_labels || {};
+    UI.meta.db_path = info.db_path || info.admin_home || '';
+    $('dbPath').textContent = UI.meta.db_path;
+    $('dbPath').title = UI.meta.db_path;
+    const sel = $('fSource');
+    sel.innerHTML = '';
+    info.sources.forEach((s) => {
+      const o = document.createElement('option');
+      o.value = s.value; o.textContent = s.label;
+      sel.appendChild(o);
+    });
+  }
+  console.log('[UI] ready', info);
+  refresh();
+});
+
+window.pyqtBridge.on('ping', function(data) {
+  console.log('[Bridge] ping 往返 OK', data && data.data);
+});
+
+window.pyqtBridge.on('list_licenses', function(res) {
+  stream('off');
+  if (!res.ok) { setStatus('查询失败'); toast(res.error || '查询失败', 'err'); return; }
+  renderRows(res.data.rows || [], res.data.stats);
+});
+
+window.pyqtBridge.on('create_license', function(res) {
+  stream('off');
+  $('btnAddConfirm').disabled = false;
+  if (!res.ok) { setStatus('生成失败'); toast(res.error || '生成失败', 'err'); return; }
+  const d = res.data || {};
+  $('addModal').classList.remove('show');
+  toast(`✅ 已生成 #${d.record && d.record.id} · ${d.record && d.record.license_key}`, 'ok');
+  setStatus('生成成功，.lic 已复制路径');
+  UI.selectedId = null;
+  refresh();
+});
+
+window.pyqtBridge.on('revoke_license', function(res) {
+  $('btnRevokeConfirm').disabled = false;
+  if (!res.ok) { toast(res.error || '作废失败', 'err'); return; }
+  $('revokeModal').classList.remove('show');
+  toast('✅ 已作废，并已自动做一份 DB 备份', 'ok');
+  UI.selectedId = null;
+  refresh();
+});
+
+window.pyqtBridge.on('export_csv', function(res) {
+  if (!res.ok) { toast(res.error || '导出失败', 'err'); return; }
+  const d = res.data || {};
+  toast(`📤 已导出：${d.path}`, 'ok');
+  setStatus('导出完成');
+});
+
+window.pyqtBridge.on('backup_db', function(res) {
+  if (!res.ok) { toast(res.error || '备份失败', 'err'); return; }
+  toast('💾 已备份到 ' + (res.data && res.data.backup_dir), 'ok');
+});
+
+window.pyqtBridge.on('open_folder', function(res) {
+  if (res.ok) toast('📂 已打开：' + (res.data && res.data.path), 'ok');
+  else toast((res.data && res.data.error) || res.error || '目录不存在', 'err');
+});
+
+// ---------- 事件绑定 ----------
+$('search').addEventListener('keydown', (e) => { if (e.key === 'Enter') refresh(); });
+$('statusFilter').addEventListener('change', refresh);
+$('btnRefresh').addEventListener('click', refresh);
+$('btnBackup').addEventListener('click', () => { window.pyqtBridge.call('backup_db', {}); });
+$('btnHome').addEventListener('click', () => { window.pyqtBridge.call('open_folder', { which: 'home' }); });
+$('btnAdd').addEventListener('click', openAdd);
+$('btnRevoke').addEventListener('click', openRevoke);
+$('btnExport').addEventListener('click', () => { window.pyqtBridge.call('export_csv', { ask_save: true }); });
+$('btnOutputDir').addEventListener('click', () => { window.pyqtBridge.call('open_folder', { which: 'output' }); });
+$('btnAddConfirm').addEventListener('click', submitAdd);
+$('btnRevokeConfirm').addEventListener('click', submitRevoke);
+$('fAmount').addEventListener('input', (e) => {
+  $('fAmountEq').textContent = '＝ ' + fmtMoney(parseInt(e.target.value || '0', 10));
+});
+document.querySelectorAll('[data-close]').forEach((b) => {
+  b.addEventListener('click', () => { $(b.dataset.close).classList.remove('show'); });
+});
+document.querySelectorAll('.modal-mask').forEach((m) => {
+  m.addEventListener('click', (e) => { if (e.target === m) m.classList.remove('show'); });
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-mask.show').forEach((m) => m.classList.remove('show'));
+  if (e.key === 'F5' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); refresh(); }
+});
+
+// 启动：等待 Python ready（若桥接不可用则给一次降级提示）
+setTimeout(() => {
+  if (!window.pyqtBridge._ready) {
+    setStatus('等待 Python 桥接…');
+  }
+}, 1500);
+</script>
+</body>
+</html>
