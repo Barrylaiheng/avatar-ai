@@ -21,6 +21,9 @@ from typing import Callable, Optional
 
 from .base import ChannelMessage
 
+# 最近一次成功初始化的默认客户端（供外部快捷引用）
+default_client: Optional['OaClient'] = None
+
 
 class OaClient:
     """公众号客户端：Flask 内嵌服务接收回调 + wechatpy 调 API。"""
@@ -144,7 +147,10 @@ class OaClient:
                 full = url
             else:
                 full = url.rstrip("/") + self.callback_path
-            req = urllib.request.Request(full + "?signature=probe&timestamp=0&nonce=0&echostr=probe")
+            req = urllib.request.Request(
+                full + "?signature=probe&timestamp=0&nonce=0&echostr=probe",
+                headers={"User-Agent": "MVP-SelfTest/1.0"},
+            )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 code = resp.getcode()
                 body = resp.read(200).decode(errors="ignore")
@@ -302,11 +308,19 @@ class OaClient:
 
     def configure(self, app_id: str, app_secret: str, token: str,
                   encoding_aes_key: str = "") -> None:
-        """（重新）配置公众号参数。"""
-        self.app_id = app_id
-        self.app_secret = app_secret
-        self.token = token
-        self.encoding_aes_key = encoding_aes_key
+        """（重新）配置公众号参数。
+
+        空字段不覆盖——前端可能不传 app_secret（安全考虑），
+        此时保留内存中已有的值，和 DB 层策略对齐。
+        """
+        if app_id:
+            self.app_id = app_id
+        if app_secret:
+            self.app_secret = app_secret
+        if token:
+            self.token = token
+        if encoding_aes_key:
+            self.encoding_aes_key = encoding_aes_key
         self._init_wx_client()
 
     # -------- 内部实现 --------
@@ -318,6 +332,8 @@ class OaClient:
         try:
             from wechatpy import WeChatClient
             self._wx_client = WeChatClient(self.app_id, self.app_secret)
+            global default_client
+            default_client = self
         except Exception as e:
             print(f"[OaClient] wechatpy 客户端初始化失败: {e}", flush=True)
             self._wx_client = None
@@ -369,14 +385,16 @@ class OaClient:
         remote = request.remote_addr or ""
         is_self_test = "MVP-SelfTest" in ua
 
+        # MVP 自验请求直接放行（不做验签，也不记录 last_verify_time）
+        if is_self_test:
+            print(f"[OaClient] MVP 自验请求，跳过验签, remote={remote}", flush=True)
+            return echostr
+
         try:
             check_signature(self.token, signature, timestamp, nonce)
-            # 只有真微信请求才记录验签时间——MVP 自验不算
-            if not is_self_test:
-                self._last_verify_time = time.time()
-                print(f"[OaClient] 微信回调验签成功: {self._last_verify_time}, ua={ua}, remote={remote}", flush=True)
-            else:
-                print(f"[OaClient] MVP 自验请求（不记录 last_verify_time）, remote={remote}", flush=True)
+            # 只有真微信请求才记录验签时间
+            self._last_verify_time = time.time()
+            print(f"[OaClient] 微信回调验签成功: {self._last_verify_time}, ua={ua}, remote={remote}", flush=True)
             return echostr
         except Exception as e:
             print(f"[OaClient] 微信回调验签失败: {e}", flush=True)
@@ -466,22 +484,46 @@ class OaClient:
         }
         msg_type = type_map.get(raw_type, "other")
 
-        channel_msg = ChannelMessage(
-            id=str(getattr(msg, "id", uuid.uuid4())),
-            channel=self.channel_name,
-            peer_id=getattr(msg, "source", ""),  # openid
-            peer_name=getattr(msg, "source", ""),
-            peer_type="friend",  # 公众号无群聊
-            sender_id=getattr(msg, "source", ""),
-            sender_name="",
-            content=getattr(msg, "content", ""),
-            msg_type=msg_type,
-            is_self=False,
-            is_at=False,
-            ts_ms=int(time.time() * 1000),
-            file_size=0,              # 🆕 OA 公众号无原生文件 size
-            is_ready=False,           # 🆕
-        )
+        # 非文本消息尽量还原出可读的 content（位置/链接/语音）
+        content = getattr(msg, "content", "") or ""
+        if raw_type == "location" and not content:
+            x = getattr(msg, "location_x", 0)
+            y = getattr(msg, "location_y", 0)
+            label = getattr(msg, "label", "")
+            scale = getattr(msg, "scale", 0)
+            content = f"[位置] {label} (纬度={x}, 经度={y}, 地图缩放={scale})"
+        elif raw_type == "link" and not content:
+            title = getattr(msg, "title", "")
+            desc = getattr(msg, "description", "")
+            url = getattr(msg, "url", "")
+            content = f"[链接] {title}\n描述: {desc}\nURL: {url}"
+        elif raw_type == "voice" and not content:
+            recognition = getattr(msg, "recognition", "") or getattr(msg, "Recognition", "")
+            fmt = getattr(msg, "format", "")
+            if recognition:
+                content = f"[语音] ASR识别结果: {recognition}"
+            else:
+                content = f"[语音] format={fmt}，但微信未返回识别文本"
+
+        channel_msg = ChannelMessage(**{
+            "id": str(getattr(msg, "id", uuid.uuid4())),
+            "channel": self.channel_name,
+            "peer_id": getattr(msg, "source", ""),  # openid
+            "peer_name": getattr(msg, "source", ""),
+            "peer_type": "friend",  # 公众号无群聊
+            "sender_id": getattr(msg, "source", ""),
+            "sender_name": "",
+            "content": content,
+            "msg_type": msg_type,
+            "is_self": False,
+            "is_at": False,
+            "ts_ms": int(time.time() * 1000),
+            "media_id": getattr(msg, "media_id", "") or getattr(msg, "MediaId", "") or "",
+            "file_path": getattr(msg, "file_path", "") or "",
+            "file_name": getattr(msg, "file_name", "") or getattr(msg, "FileName", "") or "",
+            "file_size": 0,             # OA 公众号无原生文件 size
+            "is_ready": False,
+        })
         try:
             self._on_message(channel_msg)
         except Exception as e:

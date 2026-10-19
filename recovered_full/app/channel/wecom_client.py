@@ -75,17 +75,33 @@ _MAX_LOOKBACK_SEC = 7 * 24 * 3600
 # ═══════════════════════════════════════════════════════════
 
 def _wecom_cli_path() -> str:
-    """定位 wecom-cli 可执行文件。"""
+    """定位 wecom-cli 可执行文件。
+
+    优先级：PyInstaller 内置 → PATH → 常见 npm 路径。
+    wecom-cli.exe 是 @wecom/cli platform-specific 包预编译的 9.6MB 自包含 PE32，
+    spec 里已硬打进 EXE 到 sys._MEIPASS/channels/wecom/wecom-cli.exe。
+    """
     import shutil
+    import sys
+    import os
+    # ① PyInstaller 内置（exe 解包目录）
+    if getattr(sys, "frozen", False):
+        bundled = os.path.join(sys._MEIPASS, "channels", "wecom", "wecom-cli.exe")
+        if os.path.exists(bundled):
+            return bundled
+    # ② PATH 里的命令
     p = shutil.which("wecom-cli") or shutil.which("wecom-cli.cmd")
     if p:
         return p
+    # ③ 常见 npm 安装路径
     candidates = [
-        r"C:\Users\Administrator\AppData\Roaming\npm\wecom-cli.cmd",
-        r"C:\Program Files\nodejs\wecom-cli.cmd",
+        os.path.expandvars(r"%APPDATA%\npm\node_modules\@wecom\cli\node_modules\@wecom\cli-win32-x64\bin\wecom-cli.exe"),
+        os.path.expandvars(r"%APPDATA%\npm\wecom-cli.cmd"),
+        os.path.expandvars(r"%ProgramFiles%\nodejs\wecom-cli.cmd"),
+        os.path.expandvars(r"%USERPROFILE%\AppData\Roaming\npm\wecom-cli.cmd"),
     ]
     for c in candidates:
-        if Path(c).exists():
+        if c and Path(c).exists():
             return c
     return "wecom-cli"
 
@@ -110,10 +126,17 @@ class WecomClient:
         self._connected = False
         self._on_message: Optional[Callable[[ChannelMessage], None]] = None
         self._seen_msgs: set[str] = set()
+        self._recently_sent = set()
         self._last_msg_ts = 0.0
         # ✏️ 飞书改成 _feishu_cli_path()
         self._cli = _wecom_cli_path()
         self._last_processed_ts = self._load_last_ts()
+
+        # 健康状态追踪（health_check 三态判定用）
+        self._start_ts = time.time()
+        self._last_success_ts = 0.0
+        self._last_error = ""
+        self._consecutive_failures = 0
 
     @property
     def connected(self) -> bool:
@@ -165,7 +188,14 @@ class WecomClient:
         if self._thread:
             self._thread.join(timeout=3)
         self._save_last_ts(self._last_processed_ts)
+        self.reset_state()
         print("[Wecom] 轮询线程已停止，游标已保存", flush=True)
+
+    def reset_state(self) -> None:
+        """解绑/重绑时调用，清空状态追踪残留（避免 health_check 读到上一轮的 failure 计数）。"""
+        self._last_success_ts = 0.0
+        self._last_error = ""
+        self._consecutive_failures = 0
 
     # --------- send_reply（企微特化，飞书改 JSON 结构） ---------
 
@@ -186,23 +216,60 @@ class WecomClient:
             if not ok:
                 print(f"[Wecom] send_reply 失败: {err or raw}", flush=True)
                 return False
+            # 记录最近发过的文本：轮询会把这条再拉回来，靠它去重防二次回复
+            self._recently_sent.add(content.strip())
+            if len(self._recently_sent) > 200:
+                self._recently_sent = set(list(self._recently_sent)[-100:])
             return True
         except Exception as e:
             print(f"[Wecom] send_reply 异常: {e}", flush=True)
             return False
 
     def health_check(self) -> dict:
-        """健康检查：凭证文件存在即视为已连接。
+        """健康检查：三态判定。
 
-        返回结构对齐 ChannelClient 协议（含 ok 字段），供 bridge 状态接口统一消费。
+        状态逻辑：
+          1. enc 文件不存在 → state="unbound"（未绑定）
+          2. enc 文件存在 AND (从未成功 OR 连续失败 >=3) → state="auth_expired"（需重新授权）
+          3. enc 文件存在 AND 最近成功过 → state="connected"（已连接）
+
+        轮询循环负责维护 _last_success_ts / _last_error / _consecutive_failures 三个字段，
+        health_check 只读，不新起 CLI 子进程（前端 15s 轮询一次，省资源）。
         """
-        connected = self.connected
+        enc_exists = Path.home().joinpath(".config/wecom/credentials.enc").exists()
+        now = time.time()
+
+        if not enc_exists:
+            return {
+                "channel": self.channel_name,
+                "state": "unbound",
+                "ok": False,
+                "connected": False,
+                "cli_path": self._cli,
+                "error": "未绑定企微机器人",
+                "last_success_ts": 0,
+                "consecutive_failures": 0,
+            }
+
+        never_succeeded = (self._last_success_ts == 0)
+        stable_failure = (self._consecutive_failures >= 3)
+        boot_grace_passed = (now - self._start_ts > 90)
+        if (never_succeeded and boot_grace_passed) or stable_failure:
+            state = "auth_expired"
+        else:
+            state = "connected"
+
+        ok = (state == "connected")
+        error = "" if ok else (self._last_error or "授权可能已过期，请重新扫码绑定")
         return {
             "channel": self.channel_name,
-            "ok": connected,
-            "connected": connected,
+            "state": state,
+            "ok": ok,
+            "connected": ok,
             "cli_path": self._cli,
-            "error": "" if connected else "未绑定企微机器人",
+            "error": error,
+            "last_success_ts": self._last_success_ts,
+            "consecutive_failures": self._consecutive_failures,
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -285,6 +352,8 @@ class WecomClient:
         begin = datetime.fromtimestamp(begin_ts)
         time_fmt = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
         any_new_human_msg = False
+        poll_ok = False
+        poll_error = ""
 
         # 1. 拉单聊（绑定的联系人）
         try:
@@ -294,11 +363,20 @@ class WecomClient:
                 userid = b.get("peer_id", "")
                 if not userid:
                     continue
-                new_count = self._pull_and_dispatch(1, userid, userid, begin, now, time_fmt)
+                new_count, cli_ok, cli_err = self._pull_and_dispatch(1, userid, userid, begin, now, time_fmt)
                 if new_count:
                     any_new_human_msg = True
+                if cli_ok:
+                    poll_ok = True
+                    continue
+                if poll_error:
+                    continue
+                if cli_err:
+                    poll_error = cli_err
         except Exception as e:
             print(f"[Wecom] 拉单聊绑定异常: {e}", flush=True)
+            if not poll_error:
+                poll_error = str(e)
 
         # 2. 拉群聊会话列表
         # wecom-cli v1.2+：chat groups list（旧命令 msg get_msg_chat_list 已废弃）
@@ -307,7 +385,11 @@ class WecomClient:
             "begin_time": time_fmt(begin),
             "end_time": time_fmt(now),
         })
-        if not ok_chats or not isinstance(chats_raw, dict):
+        if ok_chats and isinstance(chats_raw, dict):
+            poll_ok = True
+        else:
+            if not poll_error:
+                poll_error = err_chats
             print(f"[Wecom] 拉群聊列表失败: {err_chats}", flush=True)
             chats_raw = {}
         for chat in chats_raw.get("chats", []):
@@ -316,9 +398,25 @@ class WecomClient:
             if not chat_id:
                 continue
             # chat groups list 只返回群聊，固定 chat_type=2
-            new_count = self._pull_and_dispatch(2, chat_id, chat_name, begin, now, time_fmt)
+            new_count, cli_ok, cli_err = self._pull_and_dispatch(2, chat_id, chat_name, begin, now, time_fmt)
             if new_count:
                 any_new_human_msg = True
+            if cli_ok:
+                poll_ok = True
+                continue
+            if poll_error:
+                continue
+            if cli_err:
+                poll_error = cli_err
+
+        # 更新健康状态追踪
+        if poll_ok:
+            self._last_success_ts = now_ts
+            self._consecutive_failures = 0
+            self._last_error = ""
+        elif poll_error:
+            self._consecutive_failures += 1
+            self._last_error = poll_error[:200]
 
         # 更新持久化游标
         self._last_processed_ts = now_ts
@@ -326,13 +424,8 @@ class WecomClient:
             self._save_last_ts(self._last_processed_ts)
 
     def _pull_and_dispatch(self, chat_type: int, chatid: str, chat_name: str,
-                           begin: datetime, end: datetime, time_fmt) -> int:
-        """拉取某个会话的新消息并分发。返回实际处理的人类消息数。
-
-        wecom-cli v1.2+：chat messages list（旧命令 msg get_message 已废弃）
-          新命令只要 chat_id + time，不需要 chat_type
-          响应字段：msg_type（旧 msgtype），messages 数组顺序已是正序
-        """
+                           begin: datetime, end: datetime, time_fmt) -> tuple[int, bool, str]:
+        """拉取某个会话的新消息并分发。返回 (实际处理数, CLI是否成功, 错误信息)。"""
         try:
             ok_msg, raw, err_msg = self._cli_run("chat", "messages", "list", json_params={
                 "chat_id": chatid,
@@ -341,13 +434,13 @@ class WecomClient:
             })
             if not ok_msg or not isinstance(raw, dict):
                 print(f"[Wecom] 拉消息失败 chatid={chatid}: {err_msg}", flush=True)
-                return 0
+                return 0, False, (err_msg or "拉消息返回异常")
             # 从 extra_identity_context 解析机器人 ID（新 CLI 每次都带）
             self._extract_bot_userid(raw)
             messages = raw.get("messages", [])
         except Exception as e:
             print(f"[Wecom] 拉消息失败 chatid={chatid}: {e}", flush=True)
-            return 0
+            return 0, False, str(e)
 
         # 按时间升序排序（新 CLI 已正序，保留兜底）
         messages.sort(key=lambda m: m.get("send_time", ""))
@@ -381,14 +474,41 @@ class WecomClient:
                 content = msg_text
             elif msgtype == "voice":
                 # 企微 voice.content 已经是 ASR 转写结果
+                voice_obj = msg.get("voice") or {}
                 content = msg.get("content") or ""
-                media_id = msg.get("media_id") or msg.get("mediaId") or msg.get("url") or ""
+                media_id = voice_obj.get("media_id") or msg.get("media_id") or msg.get("mediaId") or msg.get("url") or ""
             elif msgtype in ("image", "video", "file"):
+                type_obj = msg.get(msgtype) or {}
                 content = msg.get("content") or ""
-                media_id = msg.get("media_id") or msg.get("mediaId") or msg.get("url") or ""
-                file_name = msg.get("file_name") or msg.get("filename") or msg.get("name") or ""
+                media_id = type_obj.get("media_id") or msg.get("media_id") or msg.get("mediaId") or msg.get("url") or ""
+                file_name = type_obj.get("file_name") or msg.get("file_name") or msg.get("filename") or msg.get("name") or ""
             else:
-                content = f"[非文本消息: {msgtype}]"
+                # 未知类型：尽量把 payload 里有信息量的字段抠出来，拼成可读文本
+                _parts = [f"[非文本消息: {msgtype}]"]
+                _type_obj = msg.get(msgtype) if isinstance(msg.get(msgtype), dict) else {}
+                _interesting_keys = {
+                    "title", "content", "description", "url", "href", "link", "text",
+                    "name", "desc", "nickname", "remark", "label", "reason", "address",
+                    "location", "latitude", "longitude", "amount", "meeting",
+                    "start_time", "end_time", "wxid", "userid",
+                }
+                for _k in _interesting_keys:
+                    _v = _type_obj.get(_k) or msg.get(_k)
+                    if not _v:
+                        continue
+                    if not isinstance(_v, (str, int, float)):
+                        continue
+                    _parts.append(f"{_k}={_v}")
+                for _k, _v in msg.items():
+                    if _k in ("msg_type", "userid", "send_time", "chatid", "sender", msgtype,
+                              "text", "media_id", "mediaId", "file_name"):
+                        continue
+                    if not isinstance(_v, (str, int, float)):
+                        continue
+                    if not _v:
+                        continue
+                    _parts.append(f"{_k}={_v}")
+                content = " | ".join(_parts)
 
             # 时间戳解析
             send_time_str = msg.get("send_time", "")
@@ -428,7 +548,7 @@ class WecomClient:
                 except Exception as e:
                     print(f"[Wecom] 消息回调异常: {e}", flush=True)
 
-        return dispatched
+        return dispatched, True, ""
 
     # --------- self-filter（企微特化，飞书改判断逻辑） ---------
 
@@ -439,11 +559,15 @@ class WecomClient:
         """判断是否为机器人自己发的消息。
 
         wecom-cli v1.2+ 规则：
-        1. userid 等于机器人 ID（从 extra_identity_context 解析）→ 自己发的
-        2. 消息内容包含 "(AI 生成)" → MVP 回复过的，跳过（防二次回复）
-        3. 旧 CLI 兼容：userid 带 @ 也是 bot
+        1. 最近自己发过这条文本 → 跳过（防拦截语/错误提示被二次拉取）
+        2. 消息内容包含 "(AI 生成" → MVP 正常 LLM 回复（带标记）
+        3. userid 等于机器人 ID → 自己发的
+        4. 旧 CLI 兼容：userid 带 @ 也是 bot
         """
-        # 先查 AI 生成标记（最可靠的 MVP 回复识别方式）
+        # 最近自己发过这条文本 → 跳过（防拦截语/错误提示被二次拉取）
+        if msg_text and msg_text.strip() in self._recently_sent:
+            return True
+        # 再查 AI 生成标记（MVP 正常回复带此标记）
         if msg_text and ("(AI 生成" in msg_text or "（AI 生成" in msg_text):
             return True
         # 机器人 ID 匹配

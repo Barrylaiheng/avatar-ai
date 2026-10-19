@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 import time
@@ -46,19 +47,38 @@ _POLL_OVERLAP_SEC = 60
 # API 最大回看（飞书消息历史可回看较长时间）
 _MAX_LOOKBACK_SEC = 7 * 24 * 3600
 
+# MVP 直连消息收发/群读必需 scope，用于授权完整性自检
+FEISHU_REQUIRED_SCOPES = [
+    "im:message.send_as_user",
+    "im:message.p2p_msg:get_as_user",
+    "im:message.group_msg:get_as_user",
+    "im:chat:read",
+]
+
 
 def _lark_cli_path() -> str:
-    """定位 lark-cli 可执行文件。"""
+    """定位 lark-cli 可执行文件。
+
+    lark-cli.exe 是单文件 (~48MB)，spec 里已硬打进 EXE 到
+    sys._MEIPASS/channels/feishu/lark-cli.exe，这里优先查找。
+    """
     import shutil
+    import sys
+    import os
+    if getattr(sys, "frozen", False):
+        bundled = os.path.join(sys._MEIPASS, "channels", "feishu", "lark-cli.exe")
+        if os.path.exists(bundled):
+            return bundled
     p = shutil.which("lark-cli")
     if p:
         return p
     # TRAE 插件自带的 lark-cli
     candidates = [
-        r"C:\Users\Administrator\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe",
+        os.path.expandvars(r"%USERPROFILE%\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe"),
+        os.path.expandvars(r"%USERPROFILE%\AppData\Local\lark-cli\lark-cli.exe"),
     ]
     for c in candidates:
-        if Path(c).exists():
+        if c and Path(c).exists():
             return c
     return "lark-cli"
 
@@ -67,8 +87,8 @@ class FeishuClient:
     """飞书 CLI 客户端：user 身份轮询 + 统一 ChannelClient 接口。"""
 
     channel_name = "feishu"
-    POLL_INTERVAL_ACTIVE = 15.0   # 活跃时 15s 一轮
-    POLL_INTERVAL_IDLE = 60.0     # 空闲时 60s 一轮
+    POLL_INTERVAL_ACTIVE = 3.0    # 活跃时 3s 一轮
+    POLL_INTERVAL_IDLE = 15.0     # 空闲时 15s 一轮
     ACTIVITY_WINDOW = 300.0       # 5 分钟内有新消息算活跃
 
     def __init__(self):
@@ -86,6 +106,8 @@ class FeishuClient:
         self._self_open_id: str = ""
         # 轮询游标：上次处理到的时间戳
         self._last_processed_ts = self._load_last_ts()
+        # p2p 会话映射：chat_id (oc_...) → 对方 user open_id (ou_...)
+        self._p2p_map: dict = {}
 
     @property
     def connected(self) -> bool:
@@ -189,21 +211,33 @@ class FeishuClient:
 
     def send_reply(self, peer_id: str, content: str,
                    peer_type: str = "friend", at_sender_id: str = "") -> bool:
-        """发送回复。peer_id: chat_id (oc_xxx)
+        """发送回复。
 
-        优先 user 身份（AI 接管用户账号），user 不可用时 fallback bot 身份。
+        friend: peer_id 可以是 chat_id (oc_xxx) 或 open_id (ou_xxx)，
+                自动转换为 open_id → --user-id
+        group:  peer_id=chat_id (oc_xxx) → --chat-id
         """
         try:
-            # 群聊需要 @发消息的人
             text = content
+            # 群里 @ 指定成员（飞书 <at user_id="ou_xxx"></at>）
             if at_sender_id and peer_type == "group":
                 text = f'<at user_id="{at_sender_id}"></at> {content}'
-
             # 优先 user 身份发送；失败则 fallback bot 身份
             auth_mode = self._best_auth_mode()
+            # friend: 用 --user-id；group: 用 --chat-id
+            # p2p 会话（oc_xxx）需要先转换成对方 user open_id
+            if peer_type == "friend":
+                id_flag = "--user-id"
+                if peer_id.startswith("oc_") and peer_id in self._p2p_map:
+                    send_id = self._p2p_map[peer_id]
+                else:
+                    send_id = peer_id
+            else:
+                id_flag = "--chat-id"
+                send_id = peer_id
             cmd = [
                 self._cli, "im", "+messages-send",
-                "--chat-id", peer_id,
+                id_flag, send_id,
                 "--text", text,
                 "--as", auth_mode,
             ]
@@ -224,60 +258,130 @@ class FeishuClient:
             return False
 
     def get_contacts(self) -> list[dict]:
-        """获取飞书通讯录 + 群聊列表。
+        """获取飞书通讯录 + 群聊列表（纯 lark-cli，不绕 OpenAPI）。
 
-        优先使用 user 身份（第二步 OAuth 授权后），可以拉到组织内所有可见群聊和私聊成员；
-        仅当 bot 身份可用时 fallback 到 bot 模式（只能看到 bot 被加入的群）。
+        五步流程：
+        1. im +chat-list --types=group → 拉所有群聊
+        2. 遍历每个群 → im +chat-members-list → 取群成员
+        3. im +chat-list --types=p2p → 拉所有单聊对象
+        4. tenant_key 过滤 → 排除组织外的人
+        5. 合并去重 → 返回统一 contacts 列表
         """
-        result = []
+        result: list[dict] = []
+        seen_ids: set = set()
+        seen_names: set = set()
+
         auth_mode = self._best_auth_mode()
         identity_label = "user" if auth_mode == "user" else "bot"
         print(f"[Feishu] get_contacts 使用身份: {identity_label}", flush=True)
 
-        try:
-            # 1. 拉群聊列表
+        def _run(args):
             proc = subprocess.run(
-                [self._cli, "im", "+chat-list", "--page-all", "--as", auth_mode],
-                capture_output=True, text=True, timeout=30, encoding="utf-8"
+                [self._cli] + args,
+                capture_output=True, text=True, timeout=30, encoding="utf-8",
             )
-            if proc.returncode == 0:
-                data = json.loads(proc.stdout.strip())
-                chats = data.get("data", {}).get("chats", []) if isinstance(data, dict) else []
-                for chat in chats:
-                    result.append({
-                        "peer_id": chat.get("chat_id", ""),
-                        "peer_name": chat.get("name", "") or "未命名群聊",
-                        "peer_type": "group",
-                        "member_count": chat.get("member_count", 0),
-                    })
-            else:
-                print(f"[Feishu] get_contacts chat-list 失败: {proc.stderr[:200]}", flush=True)
+            if proc.returncode != 0:
+                return None
+            try:
+                return json.loads(proc.stdout.strip())
+            except Exception:
+                return None
 
-            # 2. user 身份额外拉组织内成员（有过私聊的）
+        def _add_peer(peer_type, peer_id, peer_name, dedup_name=False, extra=None):
+            """添加 peer。dedup_name=True 时额外用 peer_name 去重（用于 friend 避免 open_id/chat_id 重复）。
+            extra: 额外字段字典（如 open_id/chat_id，用于 send_reply 转换）。"""
+            if not peer_id:
+                return
+            key = (peer_type, peer_id)
+            if key in seen_ids:
+                return
+            clean_name = (peer_name or "").strip()
+            if dedup_name and clean_name and clean_name in seen_names:
+                return
+            seen_ids.add(key)
+            if dedup_name and clean_name:
+                seen_names.add(clean_name)
+            entry = {
+                "peer_id": peer_id,
+                "peer_name": peer_name or peer_id,
+                "peer_type": peer_type,
+            }
+            if extra:
+                entry.update(extra)
+            result.append(entry)
+
+        try:
+            self_tenant = None
             if auth_mode == "user":
-                proc2 = subprocess.run(
-                    [self._cli, "contact", "+search-user", "--has-chatted",
-                     "--exclude-external-users", "--as", "user"],
-                    capture_output=True, text=True, timeout=30, encoding="utf-8"
-                )
-                if proc2.returncode == 0:
-                    data2 = json.loads(proc2.stdout.strip())
-                    users = data2.get("data", {}).get("users", []) if isinstance(data2, dict) else []
-                    for u in users:
-                        name = u.get("localized_name") or u.get("name") or u.get("en_name") or ""
-                        p2p_id = u.get("p2p_chat_id", "") or u.get("open_id", "")
-                        if not p2p_id:
+                me = _run(["contact", "+get-user", "--as", "user"])
+                if me:
+                    user_obj = me.get("data", {}).get("user", {})
+                    self_tenant = user_obj.get("tenant_key") or user_obj.get("tenant_key_str")
+                    print(f"[Feishu] 自己 tenant_key={self_tenant}", flush=True)
+
+            chats_data = _run([
+                "im", "+chat-list", "--types=group", "--page-all", "--as", auth_mode,
+            ])
+            group_chats = []
+            if chats_data:
+                chats = chats_data.get("data", {}).get("chats") or chats_data.get("data", {}).get("items", [])
+                for chat in chats:
+                    chat_id = chat.get("chat_id", "")
+                    chat_name = chat.get("name", "") or "未命名群聊"
+                    if not chat_id:
+                        continue
+                    _add_peer("group", chat_id, chat_name)
+                    group_chats.append(chat_id)
+
+            if auth_mode == "user":
+                p2p_data = _run([
+                    "im", "+chat-list", "--types=p2p", "--page-all", "--as", "user",
+                ])
+                if p2p_data:
+                    p2p_chats = p2p_data.get("data", {}).get("chats") or p2p_data.get("data", {}).get("items", [])
+                    for chat in p2p_chats:
+                        chat_id = chat.get("chat_id", "")
+                        chat_name = chat.get("name", "") or ""
+                        p2p_open_id = chat.get("p2p_target_id", "")
+                        p2p_type = chat.get("p2p_target_type", "")
+                        tenant = chat.get("tenant_key", "")
+                        if p2p_type == "bot":
                             continue
-                        result.append({
-                            "peer_id": p2p_id,
-                            "peer_name": name or p2p_id,
-                            "peer_type": "friend",
-                        })
-                else:
-                    print(f"[Feishu] get_contacts search-user 失败: {proc2.stderr[:200]}", flush=True)
+                        if self_tenant and tenant and tenant != self_tenant:
+                            continue
+                        friend_id = chat_id or p2p_open_id
+                        if friend_id:
+                            extra = {"open_id": p2p_open_id, "chat_id": chat_id}
+                            _add_peer("friend", friend_id, chat_name, dedup_name=True, extra=extra)
+                        if chat_id and p2p_open_id:
+                            self._p2p_map[chat_id] = p2p_open_id
+
+            if auth_mode == "user":
+                for chat_id in group_chats:
+                    members_data = _run([
+                        "im", "+chat-members-list",
+                        "--chat-id", chat_id,
+                        "--page-all", "--as", "user",
+                    ])
+                    if not members_data:
+                        continue
+                    bucket = members_data.get("data", {})
+                    for u in (bucket.get("users") or []):
+                        member_id = u.get("member_id", "") or u.get("open_id", "")
+                        name = u.get("name", "") or u.get("localized_name", "")
+                        member_tenant = u.get("tenant_key", "")
+                        if self_tenant and member_tenant and member_tenant != self_tenant:
+                            continue
+                        if not member_id:
+                            continue
+                        _add_peer("friend", member_id, name, dedup_name=True)
 
         except Exception as e:
             print(f"[Feishu] get_contacts 异常: {e}", flush=True)
+
+        friend_n = sum(1 for c in result if c["peer_type"] == "friend")
+        group_n = sum(1 for c in result if c["peer_type"] == "group")
+        print(f"[Feishu] get_contacts: {friend_n} 成员 / {group_n} 群聊 (tenant_filter={bool(self_tenant)})", flush=True)
         return result
 
     def _best_auth_mode(self) -> str:
@@ -314,6 +418,51 @@ class FeishuClient:
             "error": "" if connected else "未绑定飞书机器人",
         }
 
+    def check_required_scopes(self) -> dict:
+        """检查 user token 是否包含 MVP 必需的 scope。
+
+        Returns:
+            {
+                "ok": True/False,
+                "scope_ok": True/False,  # 是否完整
+                "missing": [...],        # 缺的 scope 列表
+                "granted": [...],        # 已有的 scope 列表
+                "hint": "...",           # 中文提示
+            }
+        """
+        import json as _json
+        cli = self._cli
+        if not cli:
+            return {"ok": False, "scope_ok": False,
+                    "missing": FEISHU_REQUIRED_SCOPES, "granted": [],
+                    "hint": "未找到 lark-cli"}
+        try:
+            r = subprocess.run(
+                [cli, "auth", "check", "--scope", " ".join(FEISHU_REQUIRED_SCOPES)],
+                capture_output=True, text=True, timeout=10, encoding="utf-8",
+            )
+            data = _json.loads(r.stdout)
+            missing = data.get("missing") or []
+            granted = data.get("granted") or []
+            scope_ok = len(missing) == 0
+            hint = ""
+            if scope_ok:
+                hint = "权限完整"
+            else:
+                hint = f"缺少 {len(missing)} 个必要权限: {', '.join(missing)}。可能是管理员尚未在飞书开放平台完成权限审批，请联系组织管理员后点击「补授权」重新走授权流程。"
+            print(f"[Feishu] scope 检查: ok={scope_ok} granted={len(granted)} missing={missing}", flush=True)
+            return {
+                "ok": True,
+                "scope_ok": scope_ok,
+                "missing": missing,
+                "granted": granted,
+                "hint": hint,
+            }
+        except Exception as e:
+            return {"ok": False, "scope_ok": False,
+                    "missing": FEISHU_REQUIRED_SCOPES, "granted": [],
+                    "hint": f"检查 scope 异常: {e}"}
+
     # ═══════════════════════════════════════════════════════════
     # 轮询主循环（与企微对齐）
     # ═══════════════════════════════════════════════════════════
@@ -323,6 +472,7 @@ class FeishuClient:
             try:
                 self._connected = self.connected
                 if not self._connected:
+                    print("[Feishu] connected=False, sleep 30s", flush=True)
                     time.sleep(30)
                     continue
                 self._poll_once()
@@ -340,12 +490,17 @@ class FeishuClient:
         begin_ts = max(self._last_processed_ts - _POLL_OVERLAP_SEC,
                        now_ts - _MAX_LOOKBACK_SEC)
         begin = datetime.fromtimestamp(begin_ts)
-        time_fmt = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        import datetime as _dt
+        _utc = _dt.timezone.utc
+        time_fmt = lambda dt: dt.astimezone(_utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         any_new = False
 
         try:
             from storage import channels_dao
             bindings = channels_dao.list_all_enabled_peer_occupants("feishu")
+            if len(bindings) == 0:
+                print("[Feishu] _poll_once: bindings=0, skip", flush=True)
         except Exception as e:
             print(f"[Feishu] 拉绑定列表异常: {e}", flush=True)
             bindings = []
@@ -415,7 +570,7 @@ class FeishuClient:
                 # 持久化去重集合，重启后避免 overlap 窗口内消息重复处理
                 self._save_seen_msgs()
 
-            # 解析内容（+chat-messages-list 的 text 消息 content 是纯文本字符串）
+            # 解析内容
             msg_type = msg.get("msg_type", "")
             content = ""
             file_name = ""
@@ -433,21 +588,48 @@ class FeishuClient:
             elif msg_type == "audio":
                 # voice：飞书 payload 有 Transcript 转写字段（飞书自带 ASR）
                 content = content_obj.get("Transcript") or content_obj.get("transcript") or ""
-                # 兜底：没有转写就留空，Pipeline _preprocess_voice 会占位
+                # 兜底：从文本里截取 [Audio: file_key]
                 media_id = content_obj.get("file_key") or ""
-            elif msg_type in ("image", "file"):
+                if not media_id:
+                    m = re.search(r"\[Audio:\s*(\S+)\]", raw_content_str)
+                    if m:
+                        media_id = m.group(1)
+            elif msg_type in ("image", "file", "video", "media"):
                 content = content_obj.get("text") or ""
-                media_id = content_obj.get("file_key") or ""
-                file_name = content_obj.get("file_name") or ""
-            elif msg_type == "video":
-                content = content_obj.get("text") or ""
-                media_id = content_obj.get("file_key") or ""
+                # 非文本消息：从 content JSON / 文本标签里解析 file_key（兼容多种 tag 形态）
+                media_id = ""
+                _patterns = [
+                    r"\[" + msg_type.capitalize() + r":\s*(\S+)\]",   # [File: file_xxx]
+                    "<" + msg_type + '\\s+key=\\"([^\\"]+)\\"',        # <file key="file_xxx">
+                    '<video\\s+key=\\"([^\\"]+)\\"',                   # <video key="file_xxx">
+                ]
+                for _pat in _patterns:
+                    m = re.search(_pat, raw_content_str, re.IGNORECASE)
+                    if not m:
+                        continue
+                    media_id = m.group(1)
+                    break
+                if not media_id:
+                    media_id = content_obj.get("file_key") or content_obj.get("image_key") or ""
+                # 文件名
+                file_name = ""
+                m_name = re.search(r'name="([^"]+)"', raw_content_str)
+                if m_name:
+                    file_name = m_name.group(1)
+                if not file_name:
+                    file_name = content_obj.get("file_name") or ""
+                if msg_type == "media":
+                    msg_type = "video"
+            elif msg_type == "audio":
+                msg_type = "voice"
+            elif msg_type == "interactive":
+                # 卡片消息：飞书日程/位置/名片等交互卡片，结构化解析复杂，给用户提示
+                content = "[飞书卡片消息: 日程/位置/名片/任务等，请文字描述]"
+                msg_type = "card"
             else:
                 content = f"[非文本消息: {msg_type}]"
 
-            # 时间戳解析（create_time 格式 "2026-09-12 14:53"）
             ts_ms = self._parse_create_time(msg.get("create_time", ""))
-
             sender_name = sender.get("name", "") or sender_id
             channel_msg = ChannelMessage(
                 id=message_id or f"feishu_{peer_id}_{ts_ms}",
@@ -464,17 +646,18 @@ class FeishuClient:
                 ts_ms=ts_ms,
                 file_name=file_name,
                 media_id=media_id,
-                file_size=0,              # 🆕 media_downloader 下载后补
-                is_ready=False,           # 🆕
+                file_size=0,
+                is_ready=False,
             )
 
             self._last_msg_ts = time.time()
-            if self._on_message:
-                try:
-                    self._on_message(channel_msg)
-                    dispatched += 1
-                except Exception as e:
-                    print(f"[Feishu] 消息回调异常: {e}", flush=True)
+            if not self._on_message:
+                continue
+            try:
+                self._on_message(channel_msg)
+                dispatched += 1
+            except Exception as e:
+                print(f"[Feishu] 消息回调异常: {e}", flush=True)
 
         return dispatched
 

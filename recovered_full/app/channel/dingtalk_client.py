@@ -55,9 +55,19 @@ _AUTH_CACHE_TTL_SEC = 30.0
 
 
 def _dws_cli_path() -> str:
-    """定位 dws 可执行文件。"""
+    """定位 dws 可执行文件。
+
+    dws.exe 是 Go 自包含单文件 (~33MB)，spec 里已硬打进 EXE 到
+    sys._MEIPASS/channels/dingtalk/dws.exe，这里优先查找。
+    """
     import shutil
+    import sys
     import os
+    # PyInstaller 打包优先使用内置 dws.exe
+    if getattr(sys, "frozen", False):
+        bundled = os.path.join(sys._MEIPASS, "channels", "dingtalk", "dws.exe")
+        if os.path.exists(bundled):
+            return bundled
     p = shutil.which("dws") or shutil.which("dws.exe")
     if p:
         return p
@@ -242,56 +252,108 @@ class DingtalkClient:
     # --------- 联系人 ---------
 
     def get_contacts(self) -> list[dict]:
-        """获取钉钉会话列表（单聊 + 群聊）。"""
+        """获取钉钉通讯录（纯 dws CLI）。
+
+        1. +my-groups → 所有群聊
+        2. 遍历每个群 → +chat-members-list → 群成员（openDingtalkId）
+        3. +conversation-list → 会话列表里的 p2p
+        4. 名字级去重 → 同一人只保留 openDingtalkId（p2p 是 conversationId，不权威）
+        """
         if not self.connected:
             return []
-        # 1. 拉群聊（有 memberCount）
-        group_ids: dict[str, int] = {}
-        ok_g, data_g, _ = self._cli_run(
-            "chat", "+my-groups", "--page-all", "--limit", "100", timeout=30
-        )
-        if ok_g and isinstance(data_g, dict):
-            for g in data_g.get("groups", []):
-                cid = g.get("conversationId", "")
-                if cid:
-                    group_ids[cid] = g.get("memberCount", 0)
 
-        # 2. 拉全量会话
-        ok, data, _ = self._cli_run(
-            "chat", "+conversation-list", "--page-all", "--limit", "100", timeout=30
-        )
-        if not ok or not isinstance(data, dict):
-            return []
+        result: list[dict] = []
+        seen_ids: set = set()
+        seen_names: set = set()
 
-        contacts = []
-        for c in data.get("conversations", []):
-            cid = c.get("openConversationId", "")
-            cname = c.get("conversationName", "")
-            if not cid:
-                continue
-            # 跳过系统通知类会话
-            if cname.startswith("工作通知") or cname.startswith("主页通知"):
-                continue
-            if cid in group_ids:
-                contacts.append({
-                    "peer_type": "group",
-                    "peer_id": cid,
-                    "peer_name": cname or cid[:20],
-                    "member_count": group_ids.get(cid, 0),
-                })
-            else:
-                contacts.append({
-                    "peer_type": "friend",
-                    "peer_id": cid,
-                    "peer_name": cname or cid[:20],
-                })
-        return contacts
+        def _add(peer_type, peer_id, peer_name, dedup_name=False):
+            if not peer_id:
+                return
+            key = (peer_type, peer_id)
+            if key in seen_ids:
+                return
+            clean = (peer_name or "").strip()
+            if dedup_name and clean and clean in seen_names:
+                return
+            seen_ids.add(key)
+            if dedup_name and clean:
+                seen_names.add(clean)
+            result.append({
+                "peer_type": peer_type,
+                "peer_id": peer_id,
+                "peer_name": peer_name or peer_id[:20],
+            })
+
+        try:
+            # 1. 拉群聊（含 memberCount）
+            ok_g, data_g, _ = self._cli_run(
+                "chat", "+my-groups", "--page-all", "--limit", "100", timeout=30
+            )
+            group_ids: list = []
+            if ok_g and isinstance(data_g, dict):
+                for g in data_g.get("groups", []):
+                    cid = g.get("conversationId", "")
+                    cname = g.get("name", "") or "未命名群聊"
+                    member_count = g.get("memberCount", 0)
+                    if not cid:
+                        continue
+                    if cname.startswith("工作通知") or cname.startswith("主页通知"):
+                        continue
+                    _add("group", cid, cname)
+                    group_ids.append(cid)
+                    for r in result:
+                        if r["peer_id"] == cid:
+                            r["member_count"] = member_count
+                            break
+
+            # 2. 群成员（单聊补充）
+            for cid in group_ids:
+                ok_m, data_m, _ = self._cli_run(
+                    "chat", "+chat-members-list",
+                    "--conversation-id", cid,
+                    "--member-types", "user",
+                    timeout=30,
+                )
+                if not (ok_m and isinstance(data_m, dict)):
+                    continue
+                users = data_m.get("users", []) or []
+                for u in users:
+                    odid = u.get("openDingtalkId", "") or u.get("open_dingtalk_id", "")
+                    name = u.get("name", "") or u.get("nick", "")
+                    _add("friend", odid, name, dedup_name=True)
+
+            # 3. 拉全量会话
+            ok_c, data_c, _ = self._cli_run(
+                "chat", "+conversation-list", "--page-all", "--limit", "100", timeout=30
+            )
+            if ok_c and isinstance(data_c, dict):
+                for c in data_c.get("conversations", []):
+                    cid = c.get("openConversationId", "")
+                    cname = c.get("conversationName", "")
+                    if not cid or not cname:
+                        continue
+                    if cname.startswith("工作通知") or cname.startswith("主页通知"):
+                        continue
+                    if cid in group_ids:
+                        continue
+                    _add("friend", cid, cname, dedup_name=True)
+        except Exception as e:
+            print(f"[Dingtalk] get_contacts 异常: {e}", flush=True)
+
+        friend_n = sum(1 for r in result if r["peer_type"] == "friend")
+        group_n = sum(1 for r in result if r["peer_type"] == "group")
+        print(f"[Dingtalk] get_contacts: {friend_n} 成员 / {group_n} 群聊", flush=True)
+        return result
 
     # --------- 发消息 ---------
 
     def send_reply(self, peer_id: str, content: str,
                    peer_type: str = "friend", at_sender_id: str = "") -> bool:
-        """发送回复。peer_id: openConversationId。"""
+        """发送回复。
+
+        friend: peer_id 是 userId (纯数字)，用 --user 发
+        group:  peer_id 是 openConversationId (cid...)，用 --conversation-id 发
+        """
         if not self.connected:
             return False
         # 给回复打上可读的 AI 声明（self-filter 已改为结构化判定，不依赖该标记）
@@ -299,14 +361,19 @@ class DingtalkClient:
         if _AI_MARKER not in text:
             text = content + "\n" + _AI_MARKER
         try:
+            # 群聊用 conversation-id，单聊用 user
+            if peer_type == "group" or peer_id.startswith("cid"):
+                target_args = ["--conversation-id", peer_id]
+            else:
+                target_args = ["--user", peer_id]
             ok, data, err = self._cli_run(
                 "chat", "message", "send",
-                "--conversation-id", peer_id,
+                *target_args,
                 "--content", text,
                 timeout=30,
             )
             if ok:
-                print(f"[Dingtalk] 发送成功 peer={peer_id[:20]}", flush=True)
+                print(f"[Dingtalk] 发送成功 peer={peer_id[:25]} type={peer_type}", flush=True)
                 return True
             print(f"[Dingtalk] 发送失败: {err}", flush=True)
             return False
@@ -417,7 +484,14 @@ class DingtalkClient:
             self._bound_peers = []
 
     def _poll_once(self) -> int:
-        """轮询一次所有已绑定 peer，返回新消息数。"""
+        """轮询一次所有会话，返回新消息数。
+
+        策略：
+        1. conversation-list 拿所有会话 (name→cid)
+        2. 绑定里按 peer_name 匹配 conversationName，拿到对应的 cid
+        3. 只拉这些匹配到的 cid 的消息
+        4. 每条消息 sender 名字在绑定 peer_name 里 → 处理
+        """
         if not self._bound_peers:
             return 0
 
@@ -427,95 +501,166 @@ class DingtalkClient:
                        now_ts - _MAX_LOOKBACK_SEC)
         start_time_str = datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S")
 
+        name_to_cid = self._fetch_conversation_map()
+        if not name_to_cid:
+            return 0
+
+        bound_names = {p.get("peer_name", "") for p in self._bound_peers if p.get("peer_name")}
+        target_cids = set()
+        for p in self._bound_peers:
+            pname = p.get("peer_name", "")
+            if pname and pname in name_to_cid:
+                target_cids.add(name_to_cid[pname])
+            pid = p.get("peer_id", "")
+            if pid.startswith("cid"):
+                target_cids.add(pid)
+
+        if not target_cids:
+            print("[Dingtalk] 无匹配的会话 cid，跳过本轮", flush=True)
+            return 0
+
         new_count = 0
         pull_error = False
-        for peer in self._bound_peers:
-            peer_id = peer.get("peer_id", "")
-            peer_type = peer.get("peer_type", "friend")
-            peer_name = peer.get("peer_name", "")
-            if not peer_id:
-                continue
+        for cid in target_cids:
             try:
-                msgs = self._pull_messages(peer_id, start_time_str)
+                msgs = self._pull_messages(cid, start_time_str)
                 if msgs is None:
-                    # 拉取失败：本轮不推进游标，让该时间窗在下一轮被重新覆盖
                     pull_error = True
                     continue
                 for m in msgs:
                     msg_id = m.get("messageId") or m.get("openMessageId", "")
                     if not msg_id or msg_id in self._seen_msgs:
                         continue
-                    text = m.get("text") or m.get("content", "")
                     # self-filter：跳过本端（AI / dws CLI）发出的消息，避免回声
                     if self._is_self_message(m):
                         self._seen_msgs.add(msg_id)
                         continue
                     sender_name = m.get("sender", "")
                     sender_id = m.get("senderId") or m.get("senderOpenDingTalkId", "")
+                    # 先以 cid / friend 兜底，再用绑定信息回填 peer_name / peer_type
+                    peer_id = cid
+                    peer_name = ""
+                    peer_type = "friend"
+                    for bp in self._bound_peers:
+                        bpname = bp.get("peer_name", "")
+                        bpid = bp.get("peer_id", "")
+                        if (bpname and name_to_cid.get(bpname) == cid) or bpid == cid:
+                            peer_name = bpname or sender_name
+                            peer_type = bp.get("peer_type", "friend")
+                            # 单聊用真实 openDingTalkId 作为 peer_id
+                            if peer_type == "friend" and not bpid.startswith("cid"):
+                                peer_id = bpid
+                            break
+                    if not peer_name:
+                        peer_name = name_to_cid.get(name_to_cid.get(sender_name, ""), "") or sender_name
+
+                    text = m.get("text") or ""
                     create_time_str = m.get("createTime", "")
                     ts_ms = self._parse_time_to_ms(create_time_str)
+
+                    # 钉钉 payload 里 content 可能是 dict（非文本）或 str（文本）
+                    raw_content_obj = m.get("content", "")
 
                     # 钉钉消息类型识别（原生 CLI 返回的字段）
                     raw_msgtype = (
                         m.get("msgType")
                         or m.get("msgtype")
                         or m.get("messageType")
-                        or "text"
+                        or ""
                     ).strip().lower()
+
+                    if not raw_msgtype:
+                        # 老版本 CLI 用 resources 描述类型
+                        resources = m.get("resources") or []
+                        for r in resources:
+                            rt = (r.get("resourceType") or r.get("type") or "").lower()
+                            if rt == "audio":
+                                raw_msgtype = "voice"
+                                continue
+                            if rt == "image":
+                                raw_msgtype = "image"
+                                continue
+                            if rt in ("video", "media"):
+                                raw_msgtype = "video"
+                                continue
+                            if rt == "file":
+                                raw_msgtype = "file"
+                                continue
+
                     type_map = {
                         "text": "text",
                         "textmessage": "text",
                         "voice": "voice",
                         "audiomessage": "voice",
+                        "audio": "voice",
                         "image": "image",
                         "imagemessage": "image",
                         "video": "video",
                         "videomessage": "video",
+                        "media": "video",
                         "file": "file",
                         "filemessage": "file",
                     }
                     msg_type = type_map.get(raw_msgtype, raw_msgtype or "other")
+
                     # -------- 统一提取所有非文本消息的元数据 --------
-                    # 钉钉 payload 里 content 是嵌套 dict，包含 recognition / downloadCode 等
                     file_name = ""
                     media_id = ""
-                    # 钉钉 payload 里 content 可能是 dict（非文本）或 str（文本）
-                    raw_content_obj = m.get("content")
+
                     if isinstance(raw_content_obj, str):
-                        # 字符串：可能是文件名（file）或空
+                        # 字符串内容：voice 用 [语音消息] 分段取转写文本
                         content_text = raw_content_obj
+
+                        if msg_type == "voice":
+                            import re as _re
+                            parts = _re.split(r"\n\[语音消息\]", content_text, maxsplit=1)
+                            stt_text = parts[0].strip()
+                            if stt_text:
+                                text = stt_text
+                        import re as _re
+                        if msg_type in ("voice", "image", "video"):
+                            m2 = _re.search(r"mediaId=(@\S+)", content_text)
+                            if m2:
+                                media_id = m2.group(1)
+                        if msg_type == "file":
+                            m2 = _re.search(r"fileId[=:]\s*(\S+)", content_text)
+                            if m2:
+                                media_id = m2.group(1)
+                            m3 = _re.search(r"\[文件\]\s*(.+?)\s+fileId", content_text)
+                            if m3:
+                                file_name = m3.group(1).strip()
                     elif isinstance(raw_content_obj, dict):
                         content_text = raw_content_obj.get("text", "") or ""
+                        # voice：转写字段 recognition（钉钉自带 ASR）
+                        if msg_type == "voice":
+                            recognition = raw_content_obj.get("recognition") or ""
+                            if recognition:
+                                text = recognition
+                        media_id = raw_content_obj.get("downloadCode") or ""
+                        if msg_type == "file":
+                            file_name = raw_content_obj.get("fileName") or ""
                     else:
                         content_text = ""
 
-                    # voice：转写字段 recognition（钉钉自带 ASR）
-                    if msg_type == "voice" and isinstance(raw_content_obj, dict):
-                        recognition = raw_content_obj.get("recognition") or ""
-                        if recognition:
-                            text = recognition  # 替换成转写文本，Pipeline _preprocess_voice 会直接用
+                    # 兜底：从 resources / resourceRefs 里挖出 media_id
+                    if msg_type in ("voice", "image", "video", "file") and not media_id:
+                        resources = m.get("resources") or []
+                        refs = m.get("resourceRefs") or []
+                        for r in resources + refs:
+                            rid = r.get("resourceId") or ""
+                            if not rid or not rid.startswith("@"):
+                                continue
+                            media_id = rid
 
-                    # voice/image/video/file 都有 downloadCode（统一提取）
-                    if msg_type in ("voice", "image", "video", "file"):
-                        # downloadCode 可能在 content 子对象，也可能在顶层
-                        media_id = (
-                            (raw_content_obj.get("downloadCode") if isinstance(raw_content_obj, dict) else None)
-                            or m.get("downloadCode")
-                            or m.get("mediaId")
-                            or m.get("media_id")
-                            or m.get("fileId")
-                            or ""
-                        )
-                        # 文件名：file 有 fileName，image/video 可能没有
-                        if msg_type == "file":
-                            file_name = (
-                                m.get("fileName")
-                                or m.get("filename")
-                                or (raw_content_obj.get("fileName") if isinstance(raw_content_obj, dict) else None)
-                                or ""
-                            )
-                            if not file_name and content_text and "." in content_text:
-                                file_name = content_text
+                    is_at = False
+                    if peer_type == "group":
+                        # 群里 @所有人 或 @了某个成员
+                        if m.get("isAtAll"):
+                            is_at = True
+                        else:
+                            at_users = m.get("atUsers") or []
+                            if at_users:
+                                is_at = True
 
                     cm = ChannelMessage(
                         id=msg_id,
@@ -528,12 +673,15 @@ class DingtalkClient:
                         content=text,
                         msg_type=msg_type,
                         is_self=False,
-                        is_at=False,
+                        is_at=is_at,
+                        is_at_all=bool(m.get("isAtAll")),
                         ts_ms=ts_ms,
                         file_name=file_name,
                         media_id=media_id,
-                        file_size=0,              # 🆕 media_downloader 下载后补
-                        is_ready=False,           # 🆕
+                        file_size=0,
+                        is_ready=False,
+                        open_message_id=msg_id,
+                        open_conversation_id=cid,
                     )
                     self._seen_msgs.add(msg_id)
                     if self._on_message:
@@ -556,6 +704,28 @@ class DingtalkClient:
             self._save_seen_msgs()
         return new_count
 
+    def _fetch_conversation_map(self) -> dict[str, str]:
+        """拉取所有会话，返回 {conversationName: openConversationId} 映射。
+
+        用于 friend 绑定（peer_id 是 openDingTalkId）转换成拉消息需要的 openConversationId。
+        """
+        ok, data, err = self._cli_run(
+            "chat", "+conversation-list",
+            "--page-all",
+            "--limit", "100",
+            timeout=30,
+        )
+        if not ok or not isinstance(data, dict):
+            if err:
+                print(f"[Dingtalk] conversation-list 失败: {err}", flush=True)
+            return {}
+        convs = data.get("conversations", []) or []
+        return {
+            c.get("conversationName", ""): c.get("openConversationId", "")
+            for c in convs
+            if c.get("conversationName") and c.get("openConversationId")
+        }
+
     def _pull_messages(self, peer_id: str, start_time_str: str) -> list[dict] | None:
         """拉取某个会话的新消息。
 
@@ -574,6 +744,9 @@ class DingtalkClient:
             if err:
                 print(f"[Dingtalk] 拉消息失败 peer={peer_id[:20]}: {err}", flush=True)
             return None
+        result = data.get("result") or {}
+        if isinstance(result, dict) and result.get("messages"):
+            return result["messages"]
         return data.get("messages", [])
 
     @staticmethod

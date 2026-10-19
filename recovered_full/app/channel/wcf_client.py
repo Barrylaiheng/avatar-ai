@@ -417,15 +417,14 @@ class WcfClient:
                 info["friend_count"] = sum(1 for c in normalized if c.get("peer_type") == "friend")
                 info["group_count"]  = sum(1 for c in normalized if c.get("peer_type") == "group")
                 info["wechat_version"] = info.get("wechat_version") or getattr(self, "_wechat_version", "")
-            except Exception as e:
-                print(f"[DEBUG health_check] 计算好友/群数量异常: {e}", flush=True)
+            except Exception:
+                pass
         elif port_10086 and info["wechat_logged_in"] and not self._start_connecting:
             # 通道就绪（10086在监听+微信已登录）但 MVP 自己还没作为客户端接入
             # start_wcf 正在跑时跳过，避免双重 Wcf() 抢通道导致 FUNC_IS_LOGIN 超时
             # → 临时用 remote 模式连一次，只读获取联系人/版本信息（不注入 DLL，不拉起微信）
             # → 获取完立即 cleanup，避免霸占端口；最多 5 秒完成，避免卡住前端刷新
             try:
-                print(f"[DEBUG health_check] 端口就绪+微信已登录但MVP未接入，临时 remote 拉取联系人计数", flush=True)
                 try:
                     from wcferry import Wcf as _Wcf
                 except Exception:
@@ -437,7 +436,6 @@ class WcfClient:
                     try:
                         _tmp = _Wcf(host="127.0.0.1", port=10086)
                     except Exception as _e:
-                        print(f"[DEBUG health_check] remote Wcf() 构造失败: {type(_e).__name__}: {_e}", flush=True)
                         _tmp = None
                     if _tmp is not None:
                         # 轮询 is_login 最多 3 秒（remote 模式下 is_login 很快）
@@ -505,9 +503,8 @@ class WcfClient:
                                                 break
                                         except Exception:
                                             continue
-                                print(f"[DEBUG health_check] remote 拉取完成: friends={_friends} groups={_groups} wxid={self_wxid!r} 耗时={(_t.time()-_tmp_start)*1000:.0f}ms", flush=True)
                             except Exception as _e2:
-                                print(f"[DEBUG health_check] remote 读取联系人失败: {type(_e2).__name__}: {_e2}", flush=True)
+                                pass
                         # 收尾：temp client 必须 cleanup，避免留下不释放的连接
                         try:
                             _cleanup = getattr(_tmp, "cleanup", None)
@@ -515,8 +512,8 @@ class WcfClient:
                                 _cleanup()
                         except Exception:
                             pass
-            except Exception as e:
-                print(f"[DEBUG health_check] remote 兜底拉取异常: {type(e).__name__}: {e}", flush=True)
+            except Exception:
+                pass
 
         if not port_10086 and not info["wechat_logged_in"]:
             info["hint"] = "请先打开微信并扫码登录"
@@ -524,7 +521,6 @@ class WcfClient:
             info["hint"] = "微信已登录，点击上方开关开启连接"
         elif port_10086 and not info["is_login"]:
             info["hint"] = "微信通道已就绪，可开启连接"
-        print(f"[DEBUG health_check] 完整返回: port_10086={info['port_10086']} connected={info['connected']} is_login={info['is_login']} wechat_logged_in={info['wechat_logged_in']} self_wxid={info['self_wxid']!r} friends={info['friend_count']} groups={info['group_count']} nickname={info['wechat_nickname']!r} hint={info['hint']!r}", flush=True)
         self._health_cache = info
         self._health_cache_ts = now
         return info
@@ -622,11 +618,8 @@ class WcfClient:
                 def _cb(hwnd, lparam):
                     cls = _ct.create_unicode_buffer(256)
                     _ct.windll.user32.GetClassNameW(hwnd, cls, 256)
-                    if cls.value in ("WeChatMainWndForPC", "Chrome_WidgetWin_1"):
-                        title = _ct.create_unicode_buffer(512)
-                        _ct.windll.user32.GetWindowTextW(hwnd, title, 512)
-                        if title.value and "微信" not in title.value:
-                            found[0] = True
+                    if cls.value == "WeChatMainWndForPC":
+                        found[0] = True
                     return True
                 _ct.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
                 wechat_logged = found[0]
@@ -912,31 +905,42 @@ class WcfClient:
             if file_path:
                 _is_file = os.path.isfile(file_path)
                 is_ready = _is_file
-                if _is_file:
+                # 🆕 type=49 文件的 size 藏在 content 的 XML <totallen> 里
+                try:
+                    import re as _re
+                    _ta = _re.search(r'<totallen[^>]*>(\d+)</totallen>', content)
+                    if _ta:
+                        file_size = int(_ta.group(1))
+                        if file_size > 0:
+                            print(f"[WcfClient]   → file_size 从 XML totallen 解析: {file_size} ({file_size/1024/1024:.1f}MB)", flush=True)
+                except Exception:
+                    pass
+                # 兜底：还是 0 就用本地文件大小
+                if file_size == 0 and _is_file:
                     try:
                         file_size = os.path.getsize(file_path)
                     except OSError:
                         file_size = 0
                 print(f"[WcfClient]   → file_size={file_size} is_ready={is_ready}", flush=True)
 
-            return WcfMessage(
-                id=str(getattr(raw, "id", "") or f"m_{ts_ms}_{peer_id}"),
-                channel="wcf",
-                peer_id=peer_id,
-                peer_name="",  # 上层 binding_router 会补
-                peer_type=peer_type,
-                sender_id=sender,
-                sender_name="",
-                content=content,
-                msg_type=msg_type,
-                is_self=is_self,
-                is_at=False,  # TODO: 解析 content 是否包含 @me
-                ts_ms=ts_ms or int(time.time() * 1000),
-                file_path=file_path,
-                file_name=file_name,
-                file_size=file_size,    # 🆕
-                is_ready=is_ready,      # 🆕
-            )
+            return WcfMessage(**{
+                "id": str(getattr(raw, "id", "") or f"m_{ts_ms}_{peer_id}"),
+                "channel": "wcf",
+                "peer_id": peer_id,
+                "peer_name": "",  # 上层 binding_router 会补
+                "peer_type": peer_type,
+                "sender_id": sender,
+                "sender_name": "",
+                "content": content,
+                "msg_type": msg_type,
+                "is_self": is_self,
+                "is_at": False,  # TODO: 解析 content 是否包含 @me
+                "ts_ms": ts_ms or int(time.time() * 1000),
+                "file_path": file_path,
+                "file_name": file_name,
+                "file_size": file_size,    # 🆕
+                "is_ready": is_ready,      # 🆕
+            })
         except Exception as _e:
             import traceback as _tb
             print(f"[WcfClient] ❌ normalize_raw 异常: {type(_e).__name__}: {_e}", flush=True)
@@ -985,7 +989,6 @@ class WcfClient:
 
         所以这里分别取：好友走 get_friends()，群聊走 get_contacts() 过滤 @chatroom。
         """
-        print(f"[DEBUG get_contacts] 入口: _wcf_real is None? {self._wcf_real is None} _connected={self._connected}", flush=True)
         if self._wcf_real is not None:
             try:
                 self_wxid = getattr(self, "_self_wxid", "")
@@ -1013,9 +1016,8 @@ class WcfClient:
                 friends_raw = []
                 try:
                     friends_raw = list(self._wcf_real.get_friends())
-                    print(f"[DEBUG] get_friends() 原始条数: {len(friends_raw)}", flush=True)
-                except Exception as e1:
-                    print(f"[DEBUG] get_friends() 失败: {e1}", flush=True)
+                except Exception:
+                    pass
 
                 # --- 2) 群聊：get_contacts() 里过滤 @chatroom ---
                 chatrooms_raw = []
@@ -1025,9 +1027,8 @@ class WcfClient:
                         r for r in all_raw
                         if (r.get("wxid", "") if isinstance(r, dict) else getattr(r, "wxid", "")).endswith("@chatroom")
                     ]
-                    print(f"[DEBUG] get_contacts() 总数={len(all_raw)} 其中群聊={len(chatrooms_raw)}", flush=True)
-                except Exception as e2:
-                    print(f"[DEBUG] get_contacts() 失败: {e2}", flush=True)
+                except Exception:
+                    pass
 
                 # --- 3) ★ 用 SQL 白名单再次过滤好友 ---
                 # 如果 SQL 拿到了白名单，用它过滤 get_friends() 的结果
@@ -1047,16 +1048,12 @@ class WcfClient:
 
                 # --- 4) 合并好友 + 群聊 ---
                 merged = friends_raw + chatrooms_raw
-                print(f"[DEBUG] 合并后好友={len(friends_raw)} + 群聊={len(chatrooms_raw)} = {len(merged)}", flush=True)
                 normalized = self._normalize_contacts(merged, self._wcf_real, self_wxid)
-                print(f"[DEBUG get_contacts] _normalize_contacts 处理后条数: {len(normalized)}", flush=True)
                 return normalized
             except Exception as e:
-                print(f"[DEBUG get_contacts] 读取异常: {type(e).__name__}: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
                 return []
-        print(f"[DEBUG get_contacts] WCF 未接入（无Wcf实例），直接返回空列表", flush=True)
         return []
 
     # -------- 联系人详情 & 头像 --------
@@ -1279,14 +1276,10 @@ class WcfClient:
         out.sort(key=lambda x: (0 if x["peer_type"] == "friend" else 1, (x["peer_name"] or "").lower()))
         friend_n = sum(1 for x in out if x["peer_type"] == "friend")
         group_n  = sum(1 for x in out if x["peer_type"] == "group")
-        print(f"[DEBUG _normalize_contacts] stats: {stats} → 输出{len(out)} (好友{friend_n} 群{group_n})", flush=True)
-        # ★ 打印 raw dict 所有出现过的 key，方便判断哪个 key 能区分好友/陌生人
-        print(f"[DEBUG _normalize_contacts] raw dict keys 全集: {sorted(raw_keys_seen)}", flush=True)
         for s in samples:
             print(f"  → {s}", flush=True)
         # ★ 打印非群聊样本的 type/isFriend/remark，找区分规律
         if friend_like_seen:
-            print(f"[DEBUG _normalize_contacts] 非群聊样本 (type/isFriend/remark 字段):", flush=True)
             for item in friend_like_seen:
                 print(f"    {item['wxid'][:25]:25s} {item['name'][:15]:15s} remark={item['remark'][:12]:12s} type={item['type']!r} isFriend={item['isFriend']!r} labelId={item['labelIdList']!r} verify={item['verifyFlag']!r} extra={str(item['extra'])[:25]!r}")
         return out

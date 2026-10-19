@@ -20,8 +20,8 @@ import os
 import time
 import uuid
 import base64
-import urllib.request as urllib
-import urllib.error as urllib
+import urllib.request
+import urllib.error
 
 try:
     import jwt as pyjwt

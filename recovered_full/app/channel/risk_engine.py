@@ -416,3 +416,15 @@ class RiskEngine:
         with self._lock:
             self._last_send_ts = time.time()
         self._send_lock.release()
+
+
+# ============================================================
+# 单例
+# ============================================================
+
+_DEFAULT_RISK = RiskEngine()
+
+
+def get_risk_engine() -> RiskEngine:
+    """全进程共享的 RiskEngine 单例。schedule_message / MCP 生成应用的 send_reply 都用它。"""
+    return _DEFAULT_RISK

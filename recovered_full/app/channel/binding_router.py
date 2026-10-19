@@ -35,6 +35,7 @@ class BindingRouter:
                LEFT JOIN ai_agent a ON a.id = b.agent_id
                WHERE b.channel = ? AND b.peer_id = ? AND b.enabled = 1
                  AND (a.channel = '' OR a.channel = ?)
+                 AND (a.active = 1 OR a.active IS NULL)
                ORDER BY b.updated_at DESC""",
             (channel, peer_id, channel),
         ).fetchall()
@@ -75,6 +76,7 @@ class BindingRouter:
                FROM channel_binding b
                LEFT JOIN ai_agent a ON a.id = b.agent_id
                WHERE b.channel = ? AND b.peer_id = ? AND b.enabled = 1 AND b.is_manager = 1
+                 AND (a.active = 1 OR a.active IS NULL)
                ORDER BY b.updated_at DESC""",
             (channel, peer_id),
         ).fetchall()

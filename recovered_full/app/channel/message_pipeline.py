@@ -109,6 +109,7 @@ class MessagePipeline:
         fpath = getattr(msg, "file_path", "") or ""
         fname = getattr(msg, "file_name", "") or ""
         mid = getattr(msg, "media_id", "") or ""
+        msg_type = (getattr(msg, "msg_type", "file") or "file").strip().lower()
 
         # --- 没有本地路径但有 media_id：调 media_downloader 下载 ---
         if (not fpath or not os.path.isfile(fpath)) and mid:
@@ -126,7 +127,10 @@ class MessagePipeline:
                     fname = fname or os.path.basename(fpath)
                     msg.file_path = fpath
                     msg.file_name = fname
-                    print(f"[Pipeline]   → 下载成功: {fpath} ({os.path.getsize(fpath)} bytes)", flush=True)
+                    _actual_size = os.path.getsize(fpath)
+                    if msg.file_size == 0 and _actual_size > 0:
+                        msg.file_size = _actual_size
+                    print(f"[Pipeline]   → 下载成功: {fpath} ({_actual_size} bytes)", flush=True)
                 else:
                     msg.content = (
                         f"[用户发了文件 {fname or '(未命名)'}(media_id={mid[:40]}…)，"
@@ -143,14 +147,31 @@ class MessagePipeline:
                 print(f"[Pipeline]   → 下载异常: {e}", flush=True)
                 return
 
-        # --- 彻底没路径：但如果 file_path 有值只是还没落盘，再等一轮 ---
+        # --- 彻底没路径：file 类型再等一轮落盘（等文件大小稳定）---
         if (not fpath or not os.path.isfile(fpath)) and msg_type == "file":
-            import time
-            for _retry in range(10):
+            import time as _t
+            _stable_count = 0
+            _last_size = -1
+            _max_wait = 60.0
+            _elapsed = 0.0
+            while _elapsed < _max_wait:
+                _t.sleep(0.5)
+                _elapsed += 0.5
                 if fpath and os.path.isfile(fpath):
-                    print(f"[Pipeline]   → file_path 等落盘成功 ({_retry*0.3}s)", flush=True)
-                    break
-                time.sleep(0.3)
+                    try:
+                        _sz = os.path.getsize(fpath)
+                    except OSError:
+                        _sz = 0
+                    if _sz == _last_size and _sz > 0:
+                        _stable_count += 1
+                        if _stable_count >= 2:
+                            print(f"[Pipeline]   → file_path 落盘完成 ({_elapsed}s, {_sz}B)", flush=True)
+                            break
+                    else:
+                        _stable_count = 0
+                        _last_size = _sz
+                        if _sz > 0 and _elapsed >= 2:
+                            print(f"[Pipeline]   → file_path 落盘中... ({_elapsed}s, {_sz}B)", flush=True)
 
         if not fpath or not os.path.isfile(fpath):
             msg.content = f"[用户发了文件 {fname or '(未命名)'}，但无法获取本地路径]"
@@ -281,7 +302,10 @@ class MessagePipeline:
                     fname = fname or os.path.basename(fpath)
                     msg.file_path = fpath
                     msg.file_name = fname
-                    print(f"[Pipeline]   → 下载成功: {fpath} ({os.path.getsize(fpath)} bytes)", flush=True)
+                    _actual_size = os.path.getsize(fpath)
+                    if msg.file_size == 0 and _actual_size > 0:
+                        msg.file_size = _actual_size
+                    print(f"[Pipeline]   → 下载成功: {fpath} ({_actual_size} bytes)", flush=True)
                 else:
                     # 下载失败 → 给 LLM 一个占位，让它回复友好提示
                     msg.content = f"[用户发了{mtype}，但暂时无法下载，请手动保存后描述内容，或等功能升级]"
@@ -385,13 +409,14 @@ class MessagePipeline:
     @staticmethod
     def _should_trigger_two_stage(msg: ChannelMessage, queue_depth: int) -> bool:
         """
-        融合版：只判断"要不要后台线程处理"（不负责"要不要先发一句"）。
-        - 文件/图片超过 500KB 就后台处理（给文件解析留时间）
-        - 要不要在正式回复前先发一句 → LLM 通过翻译层事实自己判断
+        运营视角：只要有二进制附件且 > 100KB，就给用户一个占位回复。
+        100KB 是 IM 平台文本消息的硬上限的 50 倍以上，不可能被纯文本误触发。
+        - image/voice/video/file 都有 file_size（微信/企微/飞书/钉钉归一化后）
+        - text/location/link 的 file_size 天然是 0，自然被过滤
         """
-        if msg.msg_type in ('file', 'image') and msg.file_size > 500 * 1024:
+        if msg.file_size > 102400:
             _mb = msg.file_size / 1024 / 1024
-            print(f"[Pipeline] 两阶段触发（后台处理）：{msg.msg_type} {_mb:.1f}MB", flush=True)
+            print(f"[Pipeline] 两阶段触发：{msg.msg_type} {_mb:.1f}MB", flush=True)
             return True
 
         return False
@@ -407,16 +432,36 @@ class MessagePipeline:
     def __process_one(self, msg: WcfMessage) -> PipelineResult:
         print(f"[Pipeline] ===== 收到新消息 ===== channel={msg.channel!r} peer={msg.peer_id!r} is_self={msg.is_self}", flush=True)
         print(f"[Pipeline]   content= {(msg.content or '')[:100]!r}", flush=True)
-        # 1) 空消息过滤
-        if not msg.content or not msg.content.strip():
-            print(f"[Pipeline]   → 空消息，丢弃", flush=True)
+
+        # 0) 类型级前置过滤：空 text、无附件非文本、自己发的
+        msg_type = getattr(msg, "msg_type", "text") or "text"
+        if msg_type in ("text", "link") and (not msg.content or not msg.content.strip()):
+            print(f"[Pipeline]   → 空 text 消息，丢弃", flush=True)
             return PipelineResult(False, "empty")
+        if msg_type not in ("text", "link"):
+            has_media = bool(getattr(msg, "media_id", "") or getattr(msg, "file_path", "") or getattr(msg, "file_name", ""))
+            if not has_media and not (msg.content or "").strip():
+                print(f"[Pipeline]   → 非文本消息({msg_type})但无 media_id/file_path，丢弃", flush=True)
+                return PipelineResult(False, "empty")
         if msg.is_self:
             print(f"[Pipeline]   → 自己发的消息，丢弃", flush=True)
             return PipelineResult(False, "self")
 
         channel = (msg.channel or "wcf").strip().lower() or "wcf"
         peer_id = msg.peer_id
+
+        # 0.5) 钉钉系统通知 / @所有人：静默跳过（不回复）
+        _sys_keywords = ('加入了群聊', '退出了群聊', '创建了群聊', '创建了会话', '成为管理员', '不再是管理员', '被移出群聊', '修改群名称', '修改群头像', '开启了群', '关闭了群')
+        _content = (msg.content or "").strip()
+        if channel == "dingtalk" and any(k in _content for k in _sys_keywords):
+            print(f"[Pipeline]   → 系统通知，静默跳过: {_content[:60]}", flush=True)
+            return PipelineResult(False, "system_notice")
+
+        if channel == "dingtalk" and msg.peer_type == "group":
+            if getattr(msg, "is_at_all", False):
+                print(f"[Pipeline]   → 群聊 @所有人，机器人不回复", flush=True)
+                return PipelineResult(False, "at_all_skip")
+
         if not peer_id:
             print(f"[Pipeline]   → 无 peer_id，丢弃", flush=True)
             return PipelineResult(False, "no peer_id")
@@ -471,7 +516,33 @@ class MessagePipeline:
             "file":    "file", "app": "file", "filemessage": "file", "attachment": "file",
         }
         fmt_key = _FMT_MAP.get(msg_type)
+
+        # 2.5.0) 卡片类消息：结构复杂暂时读不了，直接降级提示
+        if msg_type == "card":
+            _at_id = msg.sender_id if peer_type == "group" else ""
+            if is_manager_mode:
+                notice = "主人，飞书卡片消息（日程/位置/名片/任务等）我暂时读不了，麻烦让用户文字描述一下～"
+            else:
+                notice = "抱歉，这种消息我暂时读不了，麻烦文字描述一下哦～"
+            print(f"[Pipeline]   → card 类型消息，降级提示", flush=True)
+            try:
+                self.channel_client.send_reply(peer_id, notice, peer_type=peer_type, at_sender_id=_at_id)
+            except Exception as e:
+                print(f"[Pipeline]   → card 提示语发送失败: {e}", flush=True)
+            return PipelineResult(True, "card_blocked")
+
         if fmt_key:
+            # 2.5.1) 语音硬拦截：非钉钉渠道一律不支持（语音是全渠道 MVP 缺口）
+            if fmt_key == "voice" and channel not in ("dingtalk",):
+                _at_id = msg.sender_id if peer_type == "group" else ""
+                notice = "目前暂不支持语音消息，请发文字、图片、文件哦～"
+                print(f"[Pipeline]   → voice 渠道硬拦截(channel={channel})", flush=True)
+                try:
+                    self.channel_client.send_reply(peer_id, notice, peer_type=peer_type, at_sender_id=_at_id)
+                except Exception as e:
+                    print(f"[Pipeline]   → voice 拦截提示发送失败: {e}", flush=True)
+                return PipelineResult(True, "voice_blocked")
+
             # 该类型在 content_formats 里有对应开关
             raw_cf = agent.get("content_formats")
             try:
@@ -533,17 +604,42 @@ class MessagePipeline:
             if self._should_trigger_two_stage(msg, _qd):
                 file_size_mb = msg.file_size / 1024 / 1024
 
+                # 风控档位（用于占位文案的活跃度/等待时长话术）
+                _rate_level = "normal"
+                if channel == "wcf" and self.risk_config_dao:
+                    try:
+                        _rate_cfg = self.risk_config_dao.get()
+                        _rate_level = _rate_cfg.get("level", "normal")
+                    except Exception:
+                        pass
+                _hour = time.localtime().tm_hour
+
                 # --- 阶段 1：立即发占位回复 ---
                 _placeholder_sent = False
                 try:
                     placeholder = self._quick_llm_fn(
                         agent_id=agent_id, reason="file_large",
                         channel=channel, file_size_mb=file_size_mb,
+                        rate_level=_rate_level,
+                        is_manager=is_manager_mode,
+                        hour=_hour,
+                        msg_type=msg.msg_type,
                     )
                     at_id = msg.sender_id if peer_type == "group" else ""
-                    _sent_ok = self.channel_client.send_reply(
-                        peer_id, placeholder, peer_type=peer_type, at_sender_id=at_id,
-                    )
+
+                    try:
+                        self.risk_engine.acquire_send_lock(min_gap=1.0)
+                    except Exception:
+                        pass
+                    try:
+                        _sent_ok = self.channel_client.send_reply(
+                            peer_id, placeholder, peer_type=peer_type, at_sender_id=at_id,
+                        )
+                    finally:
+                        try:
+                            self.risk_engine.release_send_lock()
+                        except Exception:
+                            pass
                     if _sent_ok:
                         _placeholder_sent = True
                         print(f"[Pipeline] ★ 两阶段：占位已发送 ({placeholder[:40]}...)", flush=True)
@@ -565,11 +661,29 @@ class MessagePipeline:
 
                             # 2a. 等文件就绪（如果还没落盘）
                             if msg.msg_type in ('file', 'image') and not msg.is_ready:
-                                for _ in range(10):
+                                _stable_cnt = 0
+                                _last_sz = -1
+                                _elapsed = 0.0
+                                _max = 60.0
+                                while _elapsed < _max:
+                                    _t.sleep(0.5)
+                                    _elapsed += 0.5
                                     if _os.path.isfile(msg.file_path):
-                                        msg.is_ready = True
-                                        break
-                                    _t.sleep(0.3)
+                                        try:
+                                            _sz = _os.path.getsize(msg.file_path)
+                                        except OSError:
+                                            _sz = 0
+                                        if _sz == _last_sz and _sz > 0:
+                                            _stable_cnt += 1
+                                            if _stable_cnt >= 2:
+                                                msg.is_ready = True
+                                                print(f"[Pipeline]   → 后台等落盘完成 ({_elapsed}s, {_sz}B)", flush=True)
+                                                break
+                                        else:
+                                            _stable_cnt = 0
+                                            _last_sz = _sz
+                                if not msg.is_ready:
+                                    print(f"[Pipeline]   → 后台等落盘超时 ({_max}s)，跳过文件处理", flush=True)
 
                             # 2b. 文件预处理（补齐 content 里的文本）
                             if msg.msg_type == "file":
@@ -615,6 +729,23 @@ class MessagePipeline:
                                     _bg_facts["文件大小"] = f"{msg.file_size / 1024:.0f} KB"
                                 if getattr(msg, "file_name", ""):
                                     _bg_facts["文件名"] = msg.file_name
+                                _est_pages2 = max(1, int(_mb2 * 25))
+                                if _est_pages2 <= 3:
+                                    _bg_facts["相当于"] = "一两页纸的量"
+                                elif _est_pages2 <= 10:
+                                    _bg_facts["相当于"] = f"{_est_pages2} 页左右的量"
+                                elif _est_pages2 <= 50:
+                                    _bg_facts["相当于"] = f"{_est_pages2} 页文档"
+                                else:
+                                    _bg_facts["相当于"] = f"{_est_pages2}+ 页，内容不少"
+                                if _mb2 < 0.5:
+                                    _bg_facts["预估解析"] = "很快（几秒）"
+                                elif _mb2 < 2:
+                                    _bg_facts["预估解析"] = "需要几秒"
+                                elif _mb2 < 10:
+                                    _bg_facts["预估解析"] = "大概 10-30 秒"
+                                else:
+                                    _bg_facts["预估解析"] = "可能要 1-2 分钟"
                             payload["msg_facts"] = _bg_facts
 
                             result = self._send_message_fn(payload)
@@ -688,10 +819,11 @@ class MessagePipeline:
         }
         # ★ 可选：图片/视频 base64 data URL → Bridge 组装 image_url content block
         media_url = getattr(msg, "media_url", "") or ""
+        _mtype = getattr(msg, "msg_type", "text")
         if media_url:
-            media_cn = {"image": "图片", "video": "视频"}.get(msg_type, msg_type)
+            media_cn = {"image": "图片", "video": "视频"}.get(_mtype, _mtype)
             fname = getattr(msg, "file_name", "") or ""
-            payload["media"] = [{"type": msg_type, "url": media_url, "name": fname}]
+            payload["media"] = [{"type": _mtype, "url": media_url, "name": fname}]
             print(f"[Pipeline]   → payload.media 已注入 ({media_cn}, base64={len(media_url)}chars)", flush=True)
         # ★ 管理者模式额外字段：bridge 读这个做聚合 RAG
         if is_manager_mode:
@@ -702,7 +834,7 @@ class MessagePipeline:
         with self._bg_lock:
             _qd = self._bg_queue_depth
         _facts = {
-            "消息类型": msg_type,
+            "消息类型": getattr(msg, "msg_type", "text"),
             "对话对象": "管理者" if is_manager_mode else "普通联系人",
         }
         if msg.file_size and msg.file_size > 0:
@@ -713,6 +845,23 @@ class MessagePipeline:
                 _facts["文件大小"] = f"{msg.file_size / 1024:.0f} KB"
             if getattr(msg, "file_name", ""):
                 _facts["文件名"] = msg.file_name
+            _est_pages = max(1, int(_mb * 25))
+            if _est_pages <= 3:
+                _facts["相当于"] = "一两页纸的量"
+            elif _est_pages <= 10:
+                _facts["相当于"] = f"{_est_pages} 页左右的量"
+            elif _est_pages <= 50:
+                _facts["相当于"] = f"{_est_pages} 页文档"
+            else:
+                _facts["相当于"] = f"{_est_pages}+ 页，内容不少"
+            if _mb < 0.5:
+                _facts["预估解析"] = "很快（几秒）"
+            elif _mb < 2:
+                _facts["预估解析"] = "需要几秒"
+            elif _mb < 10:
+                _facts["预估解析"] = "大概 10-30 秒"
+            else:
+                _facts["预估解析"] = "可能要 1-2 分钟"
         if _qd > 0:
             _facts["后台队列"] = f"还有 {_qd} 条在排队"
         payload["msg_facts"] = _facts
@@ -774,16 +923,32 @@ class MessagePipeline:
                 # 只有当 delay > 5s 且 quick_llm_fn 存在时才触发
                 if decision.delay_seconds > 5 and self._quick_llm_fn is not None:
                     _risk_mb = msg.file_size / 1024 / 1024 if msg.file_size else 0
+                    _rate_level = rate_profile.get("level", "normal") if isinstance(rate_profile, dict) else "normal"
+                    _hour2 = time.localtime().tm_hour
                     try:
                         _placeholder2 = self._quick_llm_fn(
                             agent_id=agent_id, reason="risk_delay_long",
                             channel=channel, file_size_mb=_risk_mb,
+                            risk_delay=decision.delay_seconds,
+                            rate_level=_rate_level,
+                            is_manager=is_manager_mode,
+                            hour=_hour2,
+                            msg_type=msg.msg_type,
                         )
                         at_id_b = msg.sender_id if peer_type == "group" else ""
-                        # 占位不走风控（短消息天然安全），直接发
-                        self.channel_client.send_reply(
-                            peer_id, _placeholder2, peer_type=peer_type, at_sender_id=at_id_b,
-                        )
+                        try:
+                            self.risk_engine.acquire_send_lock(min_gap=1.0)
+                        except Exception:
+                            pass
+                        try:
+                            self.channel_client.send_reply(
+                                peer_id, _placeholder2, peer_type=peer_type, at_sender_id=at_id_b,
+                            )
+                        finally:
+                            try:
+                                self.risk_engine.release_send_lock()
+                            except Exception:
+                                pass
                         print(f"[Pipeline] ★ 风控长 delay: 占位已发送（delay={decision.delay_seconds}s, placeholder={_placeholder2[:40]}...）", flush=True)
                     except Exception as _e2:
                         print(f"[Pipeline] ★ 风控长 delay: 占位发送失败（继续 sleep）: {_e2}", flush=True)

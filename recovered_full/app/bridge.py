@@ -15,13 +15,18 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 # 允许从 app 目录 import storage
-sys.path.insert(0, str(Path(__file__).parent))
+_app_dir = Path(__file__).parent
+_project_root = _app_dir.parent
+sys.path.insert(0, str(_app_dir))
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 from storage import (
     agents_dao, kb_dao, docs_dao, channels_dao, llm_dao, activation_dao,
     activation_orders_dao, conv_dao, msg_dao, risk_config_dao,
     peer_profile_dao,
     now_ts,
 )
+from storage.cloud_license import poll_license, _bg_refresh
 from storage.retriever import UnifiedRetriever, ANCHOR_RULES, MANAGER_PROMPT
 from storage.doc_parser import parse_document
 from storage.llm_provider import LLMProvider
@@ -32,6 +37,7 @@ from channel.wecom_client import WecomClient
 from channel.feishu_client import FeishuClient
 from channel.dingtalk_client import DingtalkClient
 from channel.message_pipeline import MessagePipeline
+from app_registry import APPS, get_app, list_apps
 
 
 def fmt_date_short(ts):
@@ -123,6 +129,16 @@ class BridgeServer(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # 上次推送的激活快照（signature），用于只在变化时推送前端权益卡片
+        self._last_act_sig = None
+        # 需要"微信渠道特殊版"权限的动作（call 时统一 gate）
+        self._WECHAT_ACTIONS = {
+            'configure_oa', 'get_oa_verify_status', 'get_oa_status',
+            'get_oa_saved_config', 'start_oa', 'stop_oa', 'get_oa_contacts',
+            'oa_push_check', 'oa_env_check',
+            'get_wcf_status', 'fetch_wcf_contacts', 'fetch_wcf_avatar',
+            'stop_wcf', 'test_oa', 'get_wcf_health', 'test_wcf', 'start_wcf',
+        }
         # RAG 检索器单例（L1 关键词 + L2 hash 占位）
         self._retriever = UnifiedRetriever()
         self._index_ready = False
@@ -148,6 +164,25 @@ class BridgeServer(QObject):
             max_workers=2,
             thread_name_prefix="memory_refine",
         )
+        # LicenseSync：启动后台线程，3s 后首次同步云端授权状态
+        import threading as _t
+        print('[BridgeServer] 即将启动 LicenseSync 后台线程...', flush=True)
+        _t.Thread(target=self._bg_sync_activation, name='LicenseSync', daemon=True).start()
+        print('[BridgeServer] LicenseSync 线程已 start()', flush=True)
+
+    def _bg_sync_activation(self):
+        """后台线程：启动时先立即同步一次，之后每 60s 查一次云端授权状态，
+        变了自动 push 前端权益卡片。"""
+        import time as _t
+        import datetime as _dt
+        print('[LicenseSync] 后台线程启动，3s 后首次同步...', flush=True)
+        _t.sleep(3)
+        while True:
+            try:
+                self._get_effective_activation()
+            except Exception as e:
+                print(f'[LicenseSync] 后台同步异常: {e}', flush=True)
+            _t.sleep(60)
 
     def set_parent_window(self, window):
         """设置主窗口引用（QFileDialog / 弹窗的 parent）。"""
@@ -285,6 +320,13 @@ class BridgeServer(QObject):
         except Exception as e:
             print(f"[Bridge] OA 自动恢复异常: {e}", flush=True)
 
+        # 启动定时消息调度器（应用市场 · 定时消息 runner）
+        try:
+            from app.apps.schedule_message.runner import start_scheduler
+            start_scheduler()
+        except Exception as e:
+            print(f"[Bridge] Schedule 启动失败: {e}", flush=True)
+
     def stop_channel_modules(self):
         if self.pipeline is not None:
             self.pipeline.shutdown(wait=False)
@@ -325,6 +367,7 @@ class BridgeServer(QObject):
         "refresh_memory",
         "import_memory",
         "get_public_ip",
+        "prepare_feedback_package",
         "start_oa",
         "generate_wecom_qr",
         "fetch_wecom_contacts",
@@ -364,6 +407,15 @@ class BridgeServer(QObject):
         handler = getattr(self, f"_handle_{action}", None)
         if handler is None:
             self.pong.emit(json.dumps({"ok": False, "action": action, "error": f"未知操作: {action}"}, ensure_ascii=False))
+            return
+
+        try:
+            if action in self._WECHAT_ACTIONS:
+                self._require_perm("wechat", msg="微信渠道需要特殊版解锁")
+        except PermissionError as e:
+            self.pong.emit(json.dumps({
+                "ok": False, "action": action, "error": str(e), "need_activate": True,
+            }, ensure_ascii=False))
             return
 
         if action in self._HEAVY_ACTIONS:
@@ -436,11 +488,17 @@ class BridgeServer(QObject):
         import threading as _t
         _t.Thread(target=self._rebuild_index_from_db, name="RAG-IndexRebuild", daemon=True).start()
         _t.Thread(target=self._maybe_daily_memory_refine, name="Memory-DailyRefine", daemon=True).start()
+        # 云端授权后台刷新线程（fail-silent，不影响启动）
+        try:
+            from storage.machine import get_machine_code as _get_mc
+            _t.Thread(target=_bg_refresh, args=(_get_mc(),), name="CloudLicense-BgRefresh", daemon=True).start()
+        except Exception as _e:
+            print(f"[Bridge] bg_refresh 线程启动跳过: {_e}", flush=True)
         return {
             "status": "connected",
             "first_run": self._is_first_run(),
             "default_llm_id": (llm_dao.get_default() or {}).get("id"),
-            "activation": activation_dao.get_status(),
+            "activation": self._get_effective_activation(),
             "machine_code": self._handle_get_machine_code({}).get("machine_code"),
             "retriever_stats": self._retriever.stats(),
         }
@@ -530,13 +588,7 @@ class BridgeServer(QObject):
         kb_ids = payload.get("kb_ids") or []
         if not kb_ids:
             return  # 空数组无限制（免费版本就可以建"空壳智能体"）
-        act = activation_dao.get_status()
-        if act and act.get("activated"):
-            return  # 正式版放行
-        # 免费版拦截
-        raise PermissionError(
-            "免费版智能体不能绑定知识库，升级为正式版后才能使用此功能。"
-        )
+        self._require_perm("kb", msg="免费版智能体不能绑定知识库，升级入门版后才能使用")
 
     def _assert_learning_allowed(self, payload, action_name: str):
         """免费版闸门 A'：未激活用户禁止 memories.enabled=true 或 memories 非空（create/update_agent 共用）。
@@ -548,14 +600,10 @@ class BridgeServer(QObject):
         mem = self._parse_memory_json_safe(memories_raw)
         if not mem.get("enabled") and not mem.get("user_profile") and not mem.get("episodic"):
             return  # 全空结构 + enabled=false → 允许
-        act = activation_dao.get_status()
-        if act and act.get("activated"):
-            return  # 正式版放行
-        raise PermissionError(
-            "免费版智能体无法使用「智能学习（记忆系统）」，升级为正式版后才能启用自动提炼与手动录入。"
-        )
+        self._require_perm("memory", msg="升级标准版解锁记忆与进化")
 
     def _handle_create_agent(self, payload):
+        self._require_perm("agent", msg="智能体数量已达上限，升级入门版解锁更多")
         self._assert_system_prompt_tokens(payload, "create_agent")
         self._assert_kb_bind_allowed(payload, "create_agent")
         self._assert_learning_allowed(payload, "create_agent")
@@ -2078,7 +2126,10 @@ class BridgeServer(QObject):
                 )
                 if cfg.get("callback_port"):
                     self.oa_client.callback_port = int(cfg["callback_port"])
-                return {"ok": True, "config": cfg}
+                safe_cfg = {k: v for k, v in cfg.items() if k not in ('app_secret', 'encoding_aes_key')}
+                safe_cfg['has_app_secret'] = bool(cfg.get('app_secret'))
+                safe_cfg['has_encoding_aes_key'] = bool(cfg.get('encoding_aes_key'))
+                return {"ok": True, "config": safe_cfg}
         except Exception as e:
             print(f"[Bridge] 读取 OA 保存配置失败: {e}", flush=True)
         return {"ok": False, "config": {}}
@@ -2217,19 +2268,27 @@ class BridgeServer(QObject):
     def _wecom_cli_path() -> str | None:
         """定位 wecom-cli 可执行文件的完整路径。
 
-        Windows 上 npm 全局安装的命令是 .cmd/.ps1 包装器，
-        Python subprocess 直接写 'wecom-cli' 可能找不到（PATH 继承问题），
-        所以用 shutil.which 动态解析，兜底查常见 npm 全局路径。
+        优先级：PyInstaller 内置 → PATH → npm 全局路径。
+        wecom-cli.exe 是 @wecom/cli platform-specific 包预编译的 9.6MB 自包含 PE32，
+        spec 里已硬打进 EXE 到 sys._MEIPASS/channels/wecom/wecom-cli.exe。
         """
         import shutil
+        import sys
         import os
-        # 1. shutil.which（会自动处理 .exe/.cmd/.ps1 后缀）
+        # 1. PyInstaller 内置（打包时硬打到 channels/wecom/wecom-cli.exe）
+        if getattr(sys, "frozen", False):
+            bundled = os.path.join(sys._MEIPASS, "channels", "wecom", "wecom-cli.exe")
+            if os.path.isfile(bundled):
+                return bundled
+        # 2. shutil.which（会自动处理 .exe/.cmd/.ps1 后缀）
         found = shutil.which("wecom-cli") or shutil.which("wecom-cli.cmd")
         if found:
             return found
-        # 2. 兜底：npm 全局安装的常见路径
+        # 3. 兜底：npm 全局安装的常见路径
         candidates = [
+            os.path.expandvars(r"%APPDATA%\npm\node_modules\@wecom\cli\node_modules\@wecom\cli-win32-x64\bin\wecom-cli.exe"),
             os.path.expandvars(r"%APPDATA%\npm\wecom-cli.cmd"),
+            os.path.expandvars(r"%ProgramFiles%\nodejs\wecom-cli.cmd"),
             os.path.expandvars(r"%USERPROFILE%\AppData\Roaming\npm\wecom-cli.cmd"),
             "/usr/local/bin/wecom-cli",
             "/opt/homebrew/bin/wecom-cli",
@@ -2331,20 +2390,23 @@ class BridgeServer(QObject):
     def _handle_get_wecom_status(self, payload):
         """获取企业微信连接状态 + CLI 版本兼容信息。
 
-        连接判定统一走 wecom_client.health_check()（凭证文件是否存在），
-        避免 bridge 与客户端各写一套判定导致两边显示不一致。
+        连接判定统一走 wecom_client.health_check()（三态：unbound/connected/auth_expired），
+        该判定由轮询线程实际跑 CLI 调用维护，比单看 enc 文件可靠。
         """
         health = self.wecom_client.health_check()
         cli_version = self._wecom_cli_version()
         compat = self._wecom_check_compat(cli_version)
         return {
             "ok": True,
+            "state": health.get("state", "unbound"),
             "connected": bool(health.get("connected")),
             "enc_exists": self._wecom_enc_path().exists(),
             "cli_version": cli_version,
             "cli_compat": compat,
             "verified_version": self.WECOM_VERIFIED_VERSION,
             "error": health.get("error", ""),
+            "last_success_ts": health.get("last_success_ts", 0),
+            "consecutive_failures": health.get("consecutive_failures", 0),
         }
 
     def _handle_generate_wecom_qr(self, payload):
@@ -2492,9 +2554,25 @@ class BridgeServer(QObject):
             except Exception:
                 pass
 
-        # 4. 更新渠道状态
+        # 4. 清理 DB 绑定记录
+        try:
+            from storage.db import get_conn
+            conn = get_conn()
+            n1 = conn.execute('DELETE FROM channel_binding WHERE channel=?', ('wecom',)).rowcount
+            n2 = conn.execute('DELETE FROM peer_profile WHERE channel=?', ('wecom',)).rowcount
+            conn.commit()
+            print(f"[Bridge] WeCom 解绑清理: binding={n1} peer_profile={n2}", flush=True)
+        except Exception as e:
+            print(f"[Bridge] WeCom 解绑清理失败: {e}", flush=True)
+
+        # 5. 更新渠道状态
         try:
             channels_dao.upsert("wecom", connected=0, config={}, error="")
+        except Exception:
+            pass
+
+        try:
+            self.wecom_client.reset_state()
         except Exception:
             pass
 
@@ -2725,15 +2803,24 @@ class BridgeServer(QObject):
     @staticmethod
     def _feishu_cli_path() -> str | None:
         import shutil
+        import sys
         import os
+        # 1. PyInstaller 内置（打包时硬打到 channels/feishu/lark-cli.exe）
+        if getattr(sys, "frozen", False):
+            bundled = os.path.join(sys._MEIPASS, "channels", "feishu", "lark-cli.exe")
+            if os.path.isfile(bundled):
+                return bundled
+        # 2. shutil.which
         found = shutil.which("lark-cli")
         if found:
             return found
+        # 3. 兜底：环境变量路径
         candidates = [
-            r"C:\Users\Administrator\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe",
+            os.path.expandvars(r"%USERPROFILE%\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe"),
+            os.path.expandvars(r"%USERPROFILE%\AppData\Local\lark-cli\lark-cli.exe"),
         ]
         for c in candidates:
-            if os.path.isfile(c):
+            if c and os.path.isfile(c):
                 return c
         return None
 
@@ -2930,6 +3017,16 @@ class BridgeServer(QObject):
             except Exception as e:
                 return {"ok": False, "error": f"清理配置失败: {e}"}
 
+        # 清理 channel_binding 里飞书的绑定记录
+        try:
+            from storage.db import get_conn
+            conn = get_conn()
+            n = conn.execute('DELETE FROM channel_binding WHERE channel=?', ('feishu',)).rowcount
+            conn.commit()
+            print(f"[Bridge] Feishu 解绑清理: channel_binding={n}", flush=True)
+        except Exception as e:
+            print(f"[Bridge] Feishu 解绑清理失败: {e}", flush=True)
+
         try:
             channels_dao.upsert("feishu", connected=0, config={}, error="")
         except Exception:
@@ -2951,7 +3048,15 @@ class BridgeServer(QObject):
 
     @staticmethod
     def _dingtalk_cli_path() -> str | None:
-        import shutil, os
+        import shutil
+        import sys
+        import os
+        # 1. PyInstaller 内置（打包时硬打到 channels/dingtalk/dws.exe）
+        if getattr(sys, "frozen", False):
+            bundled = os.path.join(sys._MEIPASS, "channels", "dingtalk", "dws.exe")
+            if os.path.isfile(bundled):
+                return bundled
+        # 2. shutil.which
         found = shutil.which("dws") or shutil.which("dws.exe")
         if found:
             return found
@@ -3073,21 +3178,22 @@ class BridgeServer(QObject):
         reader_thread = threading.Thread(target=_read_output, daemon=True)
         reader_thread.start()
 
-        while time.time() - start < 10:
+        while time.time() - start < 25:
             if verify_url and user_code:
                 break
             # 扫描已有的输出行
             for line in output_lines:
-                if not verify_url and "login.dingtalk.com" in line and "verify" in line:
+                low = line.lower()
+                if not verify_url and "login.dingtalk.com" in low and "verify" in low:
                     # 提取 URL：可能是 "链接: https://..."
                     m = re.search(r'https://[^\s)]+verify[^\s)]*', line)
                     if m:
                         verify_url = m.group(0).strip('.:')
                 if not user_code:
-                    m = re.search(r'授权码[::]\s*([A-Z0-9-]+)', line)
+                    m = re.search(r'(?:授权码|user[_\s-]*code|code)[::]\s*([A-Z0-9-]+)', line, re.IGNORECASE)
                     if m:
                         user_code = m.group(1)
-                if not full_url and "user_code=" in line:
+                if not full_url and "user_code=" in low:
                     m = re.search(r'https://[^\s)]+?user_code=[A-Z0-9-]+', line)
                     if m:
                         full_url = m.group(0).strip('.:')
@@ -3100,6 +3206,7 @@ class BridgeServer(QObject):
             except Exception:
                 proc.kill()
             raw = "\n".join(output_lines[-20:])
+            print(f"[Bridge] Dingtalk QR 解析失败！raw output ({len(output_lines)} lines):\n{raw}", flush=True)
             return {"ok": False, "error": "未能从 dws 输出中提取二维码信息", "raw": raw[:500]}
 
         # 优先用带 user_code 的完整 URL，否则拼接
@@ -3176,6 +3283,17 @@ class BridgeServer(QObject):
                         removed = True
             except Exception as e:
                 print(f"[Bridge] Dingtalk 解绑异常: {e}", flush=True)
+
+        # 清理 channel_binding 里钉钉的绑定记录
+        try:
+            from storage.db import get_conn
+            conn = get_conn()
+            n = conn.execute('DELETE FROM channel_binding WHERE channel=?', ('dingtalk',)).rowcount
+            conn.commit()
+            print(f"[Bridge] Dingtalk 解绑清理: channel_binding={n}", flush=True)
+        except Exception as e:
+            print(f"[Bridge] Dingtalk 解绑清理失败: {e}", flush=True)
+
         print(f"[Bridge] Dingtalk 解绑完成，removed={removed}", flush=True)
         return {"ok": True, "removed": removed}
 
@@ -3208,67 +3326,134 @@ class BridgeServer(QObject):
             return False, None, str(e)
 
     def _handle_fetch_dingtalk_contacts(self, payload):
-        """拉取钉钉会话列表（conversation-list），全部作为 group 返回。
+        """拉取钉钉联系人：会话列表（私聊+群聊）+ 通讯录补充。
 
-        dws conversation-list 不区分单聊/群聊，MVP 统一 peer_type="group"，
-        后续如钉钉 CLI 支持更精细区分再升级。
+        策略（兼顾完整性和可操作性）：
+          1. conversation-list → 所有已有会话（私聊和群聊），peer_id=conversationId
+             → dingtalk_client send/pull 都用 conversationId，必须有
+          2. +my-groups → 群聊 member_count 补充
+          3. contact dept + members → 全企业通讯录名字补充，以及没聊过的同事展示
+             （没 conversationId 的成员暂无法直接发/拉消息，留作二期）
         """
         # 1. 检查是否已绑定
         if not self._dingtalk_identity_path().exists():
             return {"ok": False, "error": "钉钉未绑定，请先在连接管理扫码绑定",
                     "contacts": []}
 
-        # 2. 拉群聊补充 memberCount（+my-groups 比 conversation-list 多 memberCount）
-        group_ids = {}
-        ok_g, data_g, err_g = self._dingtalk_cli_run(
-            "chat", "+my-groups", "--page-all", "--limit", "100", "--format", "json"
+        # 2. 拉全量会话（私聊+群聊）
+        conv_map = {}
+        ok_cl, data_cl, err_cl = self._dingtalk_cli_run(
+            "chat", "+conversation-list", "--page-all", "--limit", "100",
+            "--format", "json"
         )
+        if ok_cl and isinstance(data_cl, dict):
+            for c in data_cl.get("conversations", []):
+                cid = c.get("openConversationId", "")
+                cname = c.get("conversationName", "")
+                if not cid or cname.startswith("工作通知") or cname.startswith("主页通知"):
+                    continue
+                conv_map[cid] = {"conversationId": cid, "name": cname, "peer_type": None}
+            print(f"[Bridge] Dingtalk conversation-list: {len(conv_map)} 个会话", flush=True)
+        else:
+            print(f"[Bridge] Dingtalk conversation-list 失败: {err_cl}", flush=True)
+
+        # 3. 拉群聊补充 memberCount（+my-groups 比 conversation-list 多 memberCount）
+        ok_g, data_g, err_g = self._dingtalk_cli_run(
+            "chat", "+my-groups", "--page-all", "--limit", "100",
+            "--format", "json"
+        )
+        group_ids = set()
         if ok_g and isinstance(data_g, dict):
             for g in data_g.get("groups", []):
                 cid = g.get("conversationId", "")
-                if cid:
-                    group_ids[cid] = g.get("memberCount", 0)
-            print(f"[Bridge] Dingtalk my-groups: {len(group_ids)} 个群聊有 memberCount", flush=True)
+                group_ids.add(cid)
+                if cid in conv_map:
+                    conv_map[cid]["peer_type"] = "group"
+                    conv_map[cid]["member_count"] = g.get("memberCount", 0)
+                else:
+                    cname = g.get("name", "")
+                    if cname.startswith("工作通知"):
+                        continue
+                    conv_map[cid] = {
+                        "conversationId": cid,
+                        "name": cname or cid[:20],
+                        "peer_type": "group",
+                        "member_count": g.get("memberCount", 0),
+                    }
+            print(f"[Bridge] Dingtalk my-groups: {len(group_ids)} 个群聊", flush=True)
         else:
             print(f"[Bridge] Dingtalk my-groups 失败: {err_g}", flush=True)
 
-        # 3. 拉全量会话
-        ok, data, err = self._dingtalk_cli_run(
-            "chat", "+conversation-list", "--page-all", "--limit", "100", "--format", "json"
+        # 4. 通讯录补充：全企业成员名字
+        contact_name_map = {}
+        contact_user_ids = set()
+        ok_d, data_d, err_d = self._dingtalk_cli_run(
+            "contact", "dept", "list-children", "--dept", "1",
+            "--format", "json"
         )
-        if not ok or not isinstance(data, dict):
-            msg = f"钉钉会话拉取失败: {err}"
-            print(f"[Bridge] fetch_dingtalk_contacts: {msg}", flush=True)
-            return {"ok": False, "error": msg, "contacts": []}
-
-        contacts = []
-        friend_n = group_n = 0
-        for c in data.get("conversations", []):
-            cid = c.get("openConversationId", "")
-            cname = c.get("conversationName", "")
-            # 跳过系统通知类会话（工作通知/主页通知）
-            if cname.startswith("工作通知") or cname.startswith("主页通知"):
+        dept_ids = ["1"]
+        if ok_d and isinstance(data_d, dict):
+            for d in data_d.get("result", []):
+                did = d.get("deptId")
+                if not did:
+                    continue
+                dept_ids.append(str(did))
+        for did in dept_ids:
+            ok_m, data_m, _ = self._dingtalk_cli_run(
+                "contact", "+list-dept-members", "--depts", did,
+                "--format", "json"
+            )
+            if not ok_m or not isinstance(data_m, dict):
                 continue
-            if cid in group_ids:
-                # 在 my-groups 里 → 群聊
-                contacts.append({
-                    "peer_type": "group",
-                    "peer_id": cid,
-                    "peer_name": cname or cid[:20],
-                    "member_count": group_ids.get(cid, 0),
-                })
+            for m in data_m.get("data", {}).get("members", []):
+                uid = m.get("userId", "")
+                if not uid:
+                    continue
+                contact_user_ids.add(uid)
+                contact_name_map[uid] = m.get("name", "") or uid
+        print(f"[Bridge] Dingtalk contact 通讯录: {len(contact_user_ids)} 个成员", flush=True)
+
+        # 5. 组装联系人列表
+        contacts = []
+        conv_user_names = set()
+        friend_n = group_n = 0
+        for cid, conv in conv_map.items():
+            ptype = conv.get("peer_type")
+            if ptype is None:
+                ptype = "friend"
+            entry = {
+                "peer_type": ptype,
+                "peer_id": cid,
+                "peer_name": conv.get("name", "") or cid[:20],
+            }
+            if ptype == "group":
+                entry["member_count"] = conv.get("member_count", 0)
                 group_n += 1
             else:
-                # 不在 my-groups 里 → 单聊成员
-                contacts.append({
-                    "peer_type": "friend",
-                    "peer_id": cid,
-                    "peer_name": cname or cid[:20],
-                })
                 friend_n += 1
+                conv_user_names.add(conv.get("name", ""))
+            contacts.append(entry)
+
+        # 6. 通讯录里没聊过的同事，作为可展示的成员补充
+        for uid, uname in contact_name_map.items():
+            if uname in conv_user_names or uid in conv_user_names:
+                continue
+            already = any(c.get("peer_type") == "friend" and c.get("peer_id") == uid for c in contacts)
+            if already:
+                continue
+            contacts.append({
+                "peer_type": "friend",
+                "peer_id": uid,
+                "peer_name": uname,
+                "from_contact": True,
+            })
+            friend_n += 1
+
+        contacts.sort(key=lambda c: (c.get("peer_type", ""), c.get("peer_name", "")))
 
         # 缓存供 save 时补 peer_name
         self._dingtalk_cache = contacts
+        extra_n = friend_n - (friend_n if friend_n <= len(conv_map) else len(conv_map))
         note = f"钉钉 {friend_n} 成员 / {group_n} 群聊"
         print(f"[Bridge] fetch_dingtalk_contacts: {note}", flush=True)
         return {"ok": True, "contacts": contacts, "source": "dws", "note": note}
@@ -3406,16 +3591,35 @@ class BridgeServer(QObject):
 
     # ================ 飞书 User OAuth ================
 
-    def _feishu_cli_path(self):
-        from pathlib import Path
+    def _feishu_cli_path(self) -> str | None:
+        """定位 lark-cli.exe —— 与静态方法 BridgeServer._feishu_cli_path 完全相同的查找逻辑。
+
+        历史：bridge.py 里曾有两个同名方法（L2793 静态 + L3585 实例），Python 后定义的覆盖前定义的，
+        导致静态方法里写的 sys._MEIPASS 查找完全被跳过！所有 self._feishu_cli_path() 调用
+        都走的是没 MEIPASS 的硬编码版本 —— 开发机能跑只是因为刚好有 .trae-cn/plugins/... 路径。
+        现在统一走完整查找链：MEIPASS → PATH → 环境变量路径 → fallback。
+        """
+        import shutil
+        import sys
+        import os
+        # 1. PyInstaller 内置
+        if getattr(sys, "frozen", False):
+            bundled = os.path.join(sys._MEIPASS, "channels", "feishu", "lark-cli.exe")
+            if os.path.isfile(bundled):
+                return bundled
+        # 2. shutil.which
+        found = shutil.which("lark-cli")
+        if found:
+            return found
+        # 3. 兜底：环境变量路径
         candidates = [
-            Path.home() / ".trae-cn" / "plugins" / "trae-remote-official" / "lark" / "1.0.5" / "bin" / "lark-cli.exe",
-            Path.home() / ".trae" / "plugins" / "trae-remote-official" / "lark" / "1.0.5" / "bin" / "lark-cli.exe",
-            Path("C:/Users/Administrator/.trae-cn/plugins/trae-remote-official/lark/1.0.5/bin/lark-cli.exe"),
+            os.path.expandvars(r"%USERPROFILE%\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe"),
+            os.path.expandvars(r"%USERPROFILE%\.trae\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe"),
+            os.path.expandvars(r"%USERPROFILE%\AppData\Local\lark-cli\lark-cli.exe"),
         ]
         for c in candidates:
-            if c.exists():
-                return str(c)
+            if c and os.path.isfile(c):
+                return c
         return None
 
     def _feishu_run(self, args, timeout=15):
@@ -3555,7 +3759,7 @@ class BridgeServer(QObject):
         }
 
     def _handle_poll_feishu_user_auth(self, payload):
-        """轮询 user 授权状态 — 用轻量 auth status 检查 user 身份是否已就绪。"""
+        """轮询 user 授权状态 — 有 device_code pending 时不查 auth status（旧 token 会误报）。"""
         import json as _json
         import subprocess
 
@@ -3564,9 +3768,11 @@ class BridgeServer(QObject):
             err = self._feishu_user_auth_poll_error
             self._feishu_user_auth_poll_error = None
             print(f"[Bridge][FeishuUserAuth] ⚠️ poll 返回错误: {err}", flush=True)
-            if "expired" in err:
-                return {"ok": True, "authorized": False, "expired": True}
             return {"ok": True, "authorized": False, "expired": True}
+
+        # device_code 还在轮询中 → 直接返回 pending，不跑 auth status（避免旧 token 误报）
+        if getattr(self, "_feishu_user_auth_device_code", None) and not getattr(self, "_feishu_user_auth_poll_done", False):
+            return {"ok": True, "authorized": False, "pending": True}
 
         # 轻量检查：auth status --json 立即返回
         cli = self._feishu_cli_path()
@@ -3592,7 +3798,26 @@ class BridgeServer(QObject):
                     # 授权成功后确保 pipeline 已创建 + 轮询已启动
                     # （MVP 启动时若未授权，pipeline 不会创建，需在此补建）
                     self._ensure_feishu_pipeline()
-                    return {"ok": True, "authorized": True, "username": username}
+                    scope_result = self.feishu_client.check_required_scopes()
+                    if scope_result.get("scope_ok"):
+                        print(f"[Bridge][FeishuUserAuth] ✅ scope 完整，共 {len(scope_result.get('granted', []))} 个必要 scope", flush=True)
+                        return {
+                            "ok": True,
+                            "authorized": True,
+                            "username": username,
+                            "scope_ok": True,
+                        }
+                    missing = scope_result.get("missing", [])
+                    hint = scope_result.get("hint", "")
+                    print(f"[Bridge][FeishuUserAuth] ⚠️ scope 不完整! missing={missing}", flush=True)
+                    return {
+                        "ok": True,
+                        "authorized": True,
+                        "scope_ok": False,
+                        "username": username,
+                        "missing_scopes": missing,
+                        "hint": hint,
+                    }
         except Exception:
             pass
 
@@ -3630,7 +3855,7 @@ class BridgeServer(QObject):
         return ""
 
     def _handle_get_feishu_user_auth_status(self, payload):
-        """查询 user 身份授权状态。"""
+        """查询 user 身份授权状态（含 scope 完整性检测）。"""
         import json as _json
         import subprocess
 
@@ -3652,11 +3877,24 @@ class BridgeServer(QObject):
                 bot_ident = identities.get("bot", {}) or {}
                 user_ready = user_ident.get("status") == "ready"
                 username = user_ident.get("name", "") or user_ident.get("open_id", "")
-                return {
-                    "ok": True,
-                    "authorized": user_ready,
-                    "username": username,
-                }
+                if user_ready:
+                    scope_result = self.feishu_client.check_required_scopes()
+                    if scope_result.get("scope_ok"):
+                        return {
+                            "ok": True,
+                            "authorized": True,
+                            "username": username,
+                            "scope_ok": True,
+                        }
+                    return {
+                        "ok": True,
+                        "authorized": True,
+                        "username": username,
+                        "scope_ok": False,
+                        "missing_scopes": scope_result.get("missing", []),
+                        "hint": scope_result.get("hint", ""),
+                    }
+                return {"ok": True, "authorized": False}
         except Exception:
             pass
 
@@ -3933,6 +4171,8 @@ class BridgeServer(QObject):
         """
         aid = payload.get("agent_id")
         ch  = payload.get("channel", "wcf")
+        if ch in ("wcf", "oa"):
+            self._require_perm("wechat", msg="微信渠道绑定需要特殊版解锁")
         if not aid:
             raise ValueError("缺少 agent_id")
         my_bindings = channels_dao.list_bindings(aid, ch)
@@ -3949,6 +4189,8 @@ class BridgeServer(QObject):
         aid = payload["agent_id"]
         ch  = payload["channel"]
         pid = payload["peer_id"]
+        if ch in ("wcf", "oa"):
+            self._require_perm("wechat", msg="微信渠道绑定需要特殊版解锁")
         enabled = payload.get("enabled", True)
         force_replace = bool(payload.get("force_replace", False))
 
@@ -4007,6 +4249,8 @@ class BridgeServer(QObject):
         """
         aid = payload.get("agent_id")
         ch  = payload.get("channel", "wcf")
+        if ch in ("wcf", "oa"):
+            self._require_perm("wechat", msg="微信渠道管理者设置需要特殊版解锁")
         if not aid:
             raise ValueError("缺少 agent_id")
 
@@ -4066,7 +4310,6 @@ class BridgeServer(QObject):
             print(f"[Bridge] fetch_wcf_contacts 读取失败: {e}", flush=True)
         friend_n = sum(1 for c in contacts if c.get("peer_type") == "friend")
         group_n  = sum(1 for c in contacts if c.get("peer_type") == "group")
-        print(f"[DEBUG fetch_wcf_contacts] 返回: source={source} total={len(contacts)} (好友{friend_n}/群{group_n}) note={note!r}", flush=True)
         for i, c in enumerate(contacts[:8]):
             print(f"  → 样本[{i}] peer_id={c.get('peer_id')!r} peer_name={c.get('peer_name')!r} type={c.get('peer_type')} members={c.get('member_count',0)}", flush=True)
         return {"contacts": contacts, "source": source, "note": note}
@@ -4122,7 +4365,11 @@ class BridgeServer(QObject):
 
     # ---------- 激活 / 试用 ----------
     def _handle_get_activation_status(self, payload):
-        return activation_dao.get_status()
+        """返回当前生效的授权状态。优先云端 JWT，fallback 本地。
+        payload.force=True 时跳过缓存同步查云端。
+        """
+        force = bool(payload.get("force", False))
+        return self._get_effective_activation(force)
 
     def _handle_increment_trial(self, payload):
         n = int(payload.get("n", 1))
@@ -4145,6 +4392,89 @@ class BridgeServer(QObject):
     def _handle_can_use_trial(self, payload):
         return {"ok": activation_dao.can_use_trial()}
 
+    def _get_effective_activation(self, force_refresh=False):
+        """获取当前生效的授权状态。优先 poll_license（云端 JWT），
+        超时/离线 fallback 本地 activation_dao。
+        每次调用都会对比上次快照，状态变化时自动推送给前端权益卡片。"""
+        from storage.machine import get_machine_code
+        result = None
+        try:
+            cloud = poll_license(get_machine_code(), force_refresh=force_refresh)
+            if cloud and cloud.get('active'):
+                result = cloud
+        except Exception:
+            pass
+        if result is None:
+            local = activation_dao.get_status() or {}
+            active = bool(local.get('activated'))
+            tier = local.get('tier') or ('pro' if active else 'free')
+            result = {
+                'tier': tier,
+                'active': active,
+                'activated': active,
+                'agent_cap': local.get('agent_cap', 2),
+                'kb': bool(local.get('kb', False)),
+                'memory': bool(local.get('memory', False)),
+                'wechat_unlocked': bool(local.get('wechat_unlocked', False)),
+                'tier_name': local.get('tier_name') or tier,
+                'expires_at': local.get('expires_at', 0),
+                'source': 'local',
+            }
+        sig = (
+            result.get('tier'),
+            result.get('active'),
+            result.get('wechat_unlocked'),
+            result.get('expires_at'),
+            result.get('source'),
+        )
+        import datetime as _dt
+        if sig != self._last_act_sig:
+            print(f'[Bridge] activation CHANGED: {self._last_act_sig} → {sig}', flush=True)
+            self._last_act_sig = sig
+            try:
+                self.send_to_js('activation_status_changed', result)
+                print(f"[Bridge] send_to_js('activation_status_changed') OK, tier={result.get('tier')}", flush=True)
+            except Exception as e:
+                print(f'[Bridge] send_to_js FAILED: {e}', flush=True)
+        return result
+
+    def _check_perm(self, perm):
+        """和 _require_perm 一样，但返回 bool 而不是 raise。用于'不跑'场景。"""
+        act = self._get_effective_activation()
+        if perm == 'active':
+            return bool(act.get('active'))
+        elif perm == 'memory':
+            return bool(act.get('memory'))
+        elif perm == 'kb':
+            return bool(act.get('kb'))
+        elif perm == 'agent':
+            return len(agents_dao.list_all()) < act.get('agent_cap', 2)
+        elif perm == 'wechat':
+            return bool(act.get('wechat_unlocked'))
+        else:
+            return bool(act.get('active'))
+
+    def _require_perm(self, perm, msg=None):
+        """统一权限 gate：没权限直接 raise PermissionError。
+        perm 取值: 'memory' | 'kb' | 'agent' | 'wechat' | 'active'
+        """
+        act = self._get_effective_activation()
+        if perm == 'active':
+            ok = bool(act.get('active'))
+        elif perm == 'memory':
+            ok = bool(act.get('memory'))
+        elif perm == 'kb':
+            ok = bool(act.get('kb'))
+        elif perm == 'agent':
+            cap = act.get('agent_cap', 2)
+            ok = len(agents_dao.list_all()) < cap
+        elif perm == 'wechat':
+            ok = bool(act.get('wechat_unlocked'))
+        else:
+            ok = bool(act.get('active'))
+        if not ok:
+            raise PermissionError(msg or '需要升级才能使用此功能')
+
     # ---------- 支付 / 激活码（虎皮椒 V3） ----------
     def _handle_get_machine_code(self, payload):
         """返回本机机器码，前端激活 Modal Tab2 展示用。"""
@@ -4152,155 +4482,175 @@ class BridgeServer(QObject):
         return {"machine_code": get_machine_code()}
 
     def _handle_pay_create(self, payload):
-        """创建支付订单：取本机机器码 → 下单 → 入库 → 返回二维码/金额/过期时间。
+        """创建支付订单 → 调云端 cloud_server 真虎皮椒下单。
 
-        前端 payload（可选字段都可不传）：
-            amount_yuan: float   (默认 299)
-            goods_name:  str
-            notify_url:  str     (默认 http://127.0.0.1:8765/pay/xunhupay/notify)
-        返回：create_order 的完整结构 + order 入库快照。
+        前端 payload：
+            tier: str  (starter/standard/pro/special)  ← 推荐，档位定价走云端
+            amount_yuan: float  (可选，老前端兼容)
         """
+        import urllib.request as _ur
+        import urllib.error as _ue
         from storage.machine import get_machine_code
-        from storage import payment as pay_mod
+        from storage.cloud_license import CLOUD_BASE
 
         machine_code = get_machine_code()
-        amount_yuan = payload.get("amount_yuan") or pay_mod.PAY_AMOUNT_YUAN
-        goods_name = (payload.get("goods_name") or None)
-        notify_url = (payload.get("notify_url") or None) or pay_mod.default_notify_url()
+        tier = (payload.get("tier") or "").strip()
+        if not tier:
+            # 老前端：按金额反推档位
+            amount = float(payload.get("amount_yuan") or 299)
+            _TIER_BY_AMT = {
+                0.1: "starter", 0.2: "standard", 0.3: "pro", 0.4: "special",
+                19.0: "starter", 39.0: "standard", 99.0: "pro", 199.0: "special",
+            }
+            tier = _TIER_BY_AMT.get(round(amount, 2), "starter")
 
-        result = pay_mod.create_order(
-            machine_code,
-            amount_yuan=amount_yuan,
-            goods_name=goods_name,
-            notify_url=notify_url,
+        body = json.dumps({"machine_code": machine_code, "tier": tier}).encode("utf-8")
+        req = _ur.Request(
+            f"{CLOUD_BASE}/api/pay/create",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        if not result.get("ok"):
-            raise RuntimeError(result.get("error") or "下单失败")
+        try:
+            with _ur.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read())
+        except (_ue.URLError, _ue.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            if isinstance(e, _ue.HTTPError):
+                try:
+                    err_detail = e.read().decode("utf-8", errors="replace")
+                    try:
+                        err_json = json.loads(err_detail)
+                        err_detail = err_json.get("error") or err_detail
+                    except Exception:
+                        pass
+                except Exception:
+                    err_detail = ""
+                raise RuntimeError(err_detail or f"HTTP {e.code}")
+            raise RuntimeError(f"云端下单失败：{e}")
 
-        # 入库 activation_orders（幂等：同一 trade_order_id 不会重复插）
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "云端返回 ok=false")
+
+        trade_order_id = result["trade_order_id"]
+        qr_url = result.get("qr_url") or ""
+        amount_cents = int(result.get("amount_cents") or 0)
+        mode = result.get("mode") or "real"
+
+        # 本地入库（幂等：同一 trade_order_id 不会重复插）
+        expires_at = int(time.time()) + 900
         try:
             order = activation_orders_dao.create({
-                "id": result["trade_order_id"],
+                "id": trade_order_id,
                 "xunhu_order_id": result.get("xunhu_order_id") or "",
                 "transaction_id": "",
                 "machine_code": machine_code,
-                "amount_cents": result["amount_cents"],
-                "amount_yuan": result["amount_yuan"],
+                "amount_cents": amount_cents,
+                "amount_yuan": amount_cents / 100.0,
                 "status": "created",
-                "mode": result.get("mode") or ("mock" if pay_mod.USE_MOCK else "real"),
-                "goods_name": result["goods_name"],
+                "mode": mode,
+                "goods_name": f"阿维达AI · {tier} 档",
                 "attach_json": {
-                    "notify_url": notify_url,
-                    "source": "bridge.create_order",
+                    "notify_url": f"{CLOUD_BASE}/api/pay/xunhu_notify",
+                    "source": "bridge._handle_pay_create → cloud",
+                    "tier": tier,
                 },
-                "qr_url": result.get("qr_url") or "",
+                "qr_url": qr_url,
                 "license_key": "",
-                "created_at": int(result.get("expires_at") or now_ts()) - pay_mod.ORDER_EXPIRE_SECONDS,
-                "expires_at": result.get("expires_at"),
+                "created_at": int(time.time()),
+                "expires_at": expires_at,
             })
         except Exception as e:  # noqa: BLE001
-            # 允许创建失败但仍把二维码下发（前端照样能扫/能模拟支付），日志里提示一下
-            print(f"[PAY] 订单入库失败（仍然返回二维码）：{e}", flush=True)
+            print(f"[PAY] 本地入库失败（仍然返回二维码）：{e}", flush=True)
             order = None
 
-        # 顺手拉起本地回调监听（端口占用/重复启动都安全）
-        self._ensure_notify_server_running()
-
-        # 生成 QR 码 base64（前端直接 <img src="data:image/png;base64,...">）
-        qr_url = result.get("qr_url") or ""
+        # 从云端拿到的是虎皮椒 PNG 图片 URL → 下载转 base64（前端直接 <img src=...>）
         qr_base64 = ""
         if qr_url:
             try:
-                import io as _io
-                import qrcode as _qrcode
-                qr = _qrcode.QRCode(version=2, error_correction=_qrcode.constants.ERROR_CORRECT_L,
-                                    box_size=8, border=2)
-                qr.add_data(qr_url)
-                qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-                buf = _io.BytesIO()
-                img.save(buf, format="PNG")
+                req2 = _ur.Request(qr_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                with _ur.urlopen(req2, timeout=10) as img_resp:
+                    png_bytes = img_resp.read()
                 import base64 as _b64
-                qr_base64 = "data:image/png;base64," + _b64.b64encode(buf.getvalue()).decode("ascii")
+                qr_base64 = "data:image/png;base64," + _b64.b64encode(png_bytes).decode("ascii")
             except Exception as e:  # noqa: BLE001
-                print(f"[PAY] QR 码生成失败（不影响下单）: {e}", flush=True)
+                print(f"[PAY] 下载虎皮椒 PNG 失败（前端会尝试直接 URL）: {e}", flush=True)
 
         return {
-            **result,
-            "machine_code": machine_code,
-            "notify_url": notify_url,
+            "ok": True,
+            "mode": mode,
+            "tier": tier,
+            "trade_order_id": trade_order_id,
+            "xunhu_order_id": result.get("xunhu_order_id") or "",
+            "qr_url": qr_url,
             "qr_base64": qr_base64,
+            "amount": result.get("amount") or f"¥{amount_cents / 100:.2f}",
+            "amount_yuan": amount_cents / 100.0,
+            "amount_cents": amount_cents,
+            "expires_at": expires_at,
+            "machine_code": machine_code,
+            "notify_url": f"{CLOUD_BASE}/api/pay/xunhu_notify",
             "order": order,
         }
 
     def _handle_pay_poll(self, payload):
-        """前端轮询订单状态。收到 paid=True 后自动：mark_paid + 本机激活 + 推送 JS 刷新激活态。
+        """前端轮询云端订单状态。paid=True 后：云端已自动激活 license → 本机只刷新 JWT。
 
         payload: { trade_order_id: str }
         """
+        import urllib.request as _ur
+        import urllib.error as _ue
         from storage.machine import get_machine_code
-        from storage import payment as pay_mod
+        from storage.cloud_license import CLOUD_BASE
 
         order_id = (payload.get("trade_order_id") or payload.get("order_id") or "").strip()
         if not order_id:
             raise ValueError("缺少 trade_order_id")
 
         machine_code = get_machine_code()
-        # 先做一次过期检查
         activation_orders_dao.mark_expired_if_needed(order_id)
 
-        polled = pay_mod.poll_order(order_id, machine_code=machine_code)
+        body = json.dumps({"trade_order_id": order_id}).encode("utf-8")
+        req = _ur.Request(f"{CLOUD_BASE}/api/pay/poll",
+                          data=body, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with _ur.urlopen(req, timeout=10) as resp:
+                polled = json.loads(resp.read())
+        except (_ue.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            return {"ok": False, "paid": False, "error": f"云端查单失败：{e}"}
+
         if not polled.get("ok"):
-            return {"ok": False, "paid": False, "error": polled.get("error") or "查单失败"}
+            return {"ok": False, "paid": False, "error": polled.get("error") or "云端查单 ok=false"}
 
         paid = bool(polled.get("paid"))
-        lic = polled.get("license_key") or ""
         activated = False
         activation_result = None
         order_snap = activation_orders_dao.get(order_id)
 
         if paid:
-            # 1) 订单流转 paid（幂等）
             if order_snap:
-                order_snap, first_time = activation_orders_dao.mark_paid(
+                order_snap, _ = activation_orders_dao.mark_paid(
                     order_id,
-                    transaction_id=polled.get("trade_no") or "",
-                    xunhu_order_id=polled.get("out_trade_no") or "",
                     paid_at=polled.get("paid_at") or None,
-                    license_key=lic,
-                    attach_json={
-                        "paid_via": "poll",
-                        "poll_payload": {k: v for k, v in polled.items() if k != "license_key"},
-                    },
+                    attach_json={"paid_via": "cloud_callback → local_poll"},
                 )
-            # 2) 如果订单机器码就是本机 → 直接激活（最顺路径）
-            target_mc = order_snap.get("machine_code") if order_snap else ""
-            if not target_mc:
-                target_mc = polled.get("attach") or machine_code
-            if target_mc == machine_code and lic:
-                try:
-                    activation_result = activation_dao.activate(lic, machine_code)
-                    activated = bool(activation_result and activation_result.get("activated"))
-                except Exception as e:  # noqa: BLE001
-                    print(f"[PAY] 轮询激活失败: {e}", flush=True)
-                    activation_result = {"error": str(e)}
+            try:
+                activation_result = self._get_effective_activation(force_refresh=True)
+                activated = bool(activation_result and activation_result.get("active"))
+            except Exception as e:  # noqa: BLE001
+                print(f"[PAY] 云端 JWT 刷新失败: {e}", flush=True)
+                activation_result = {"error": str(e)}
             if activated:
-                # 推给前端：立即刷新「正式版」徽标 & 解锁知识库绑定
-                self.send_to_js("activation_status_changed", {
-                    "activated": True,
-                    "trigger": "poll",
-                    "status": activation_dao.get_status(),
-                })
+                act = activation_result if isinstance(activation_result, dict) else {}
+                self.send_to_js("activation_status_changed", {"activated": True, "trigger": "poll", **act})
 
         return {
             "ok": True,
             "paid": paid,
-            "status": order_snap.get("status") if order_snap else None,
+            "status": polled.get("status"),
+            "tier": polled.get("tier"),
             "activated": activated,
-            "paid_at": polled.get("paid_at") or 0,
-            "machine_code": polled.get("attach") or machine_code,
-            "trade_no": polled.get("trade_no") or "",
-            "note": polled.get("note"),
+            "paid_at": polled.get("paid_at"),
+            "machine_code": polled.get("machine_code") or machine_code,
             "activation": activation_result,
         }
 
@@ -4709,8 +5059,7 @@ class BridgeServer(QObject):
                   · 物理进度：已学习牛顿第二定律…」这样的块
         """
         # —— 闸门 C：免费版完全不注入记忆（哪怕 DB 里存了也白存）——
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
+        if not self._check_perm("memory"):
             return ""
         if not memories_raw or not isinstance(memories_raw, str):
             return ""
@@ -5055,8 +5404,7 @@ class BridgeServer(QObject):
             if not agent_id or not conv_id:
                 return None
             # —— 闸门 B：未激活完全不提炼，避免浪费 LLM token ——
-            act = activation_dao.get_status()
-            if not (act and act.get("activated")):
+            if not self._check_perm("memory"):
                 return None
             # 开关 & 阈值检查（查一次 agent + 一次 conv，SQLite 本地很快）
             agent = agents_dao.get(agent_id)
@@ -5231,8 +5579,7 @@ class BridgeServer(QObject):
         if not agent:
             return 0
         # 闸门：未激活跳过
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
+        if not self._check_perm("memory"):
             return 0
         # 拿 LLM 配置
         llm_id = agent.get("llm_config_id") or ""
@@ -5370,9 +5717,7 @@ class BridgeServer(QObject):
         if not agent:
             raise ValueError("智能体不存在")
         # —— 闸门：未激活直接拒（和 create/update_agent 上的闸门 A 对齐）——
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
-            raise PermissionError("升级正式版后解锁智能体学习功能")
+        self._require_perm("memory", msg="升级标准版解锁记忆与进化")
         mem = self._parse_memory_json_safe(agent.get("memories") or "")
 
         # 优先用 pending（除非 force=true）
@@ -5432,9 +5777,7 @@ class BridgeServer(QObject):
         agent = agents_dao.get(agent_id) if agent_id else None
         if not agent:
             raise ValueError("智能体不存在")
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
-            raise PermissionError("升级正式版后解锁")
+        self._require_perm("memory", msg="升级标准版解锁记忆与进化")
         old_mem = self._parse_memory_json_safe(agent.get("memories") or "")
         before_profile = list(old_mem.get("user_profile") or [])
         before_episodic = list(old_mem.get("episodic") or [])
@@ -5502,8 +5845,7 @@ class BridgeServer(QObject):
         对齐 Workbody「每晚自动整理」：实际是每 24 小时一次，软件启动时触发检查。
         """
         try:
-            act = activation_dao.get_status()
-            if not (act and act.get("activated")):
+            if not self._check_perm("memory"):
                 return  # 未激活不跑
             now = now_ts()
             day_seconds = 24 * 3600
@@ -5572,9 +5914,7 @@ class BridgeServer(QObject):
         agent = agents_dao.get(agent_id)
         if not agent:
             raise ValueError("智能体不存在")
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
-            raise PermissionError("升级正式版后解锁智能体学习功能")
+        self._require_perm("memory", msg="升级标准版解锁记忆与进化")
 
         result = self._do_memory_extract_pure(agent_id)
         has_result = (result.get("user_profile") or []) or (result.get("episodic") or [])
@@ -5636,9 +5976,7 @@ class BridgeServer(QObject):
         agent = agents_dao.get(agent_id)
         if not agent:
             raise ValueError("智能体不存在")
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
-            raise PermissionError("升级正式版后解锁智能体学习功能")
+        self._require_perm("memory", msg="升级标准版解锁记忆与进化")
 
         # 立即返回，后台异步执行
         self._memory_executor.submit(self._do_import_memory_async, agent_id, conv_ids)
@@ -5681,9 +6019,7 @@ class BridgeServer(QObject):
         agent = agents_dao.get(agent_id) if agent_id else None
         if not agent:
             raise ValueError("智能体不存在")
-        act = activation_dao.get_status()
-        if not (act and act.get("activated")):
-            raise PermissionError("升级正式版后解锁")
+        self._require_perm("memory", msg="升级标准版解锁记忆与进化")
         old_mem = self._parse_memory_json_safe(agent.get("memories") or "")
         history = list(old_mem.get("history") or [])
         if not history:
@@ -5743,6 +6079,11 @@ class BridgeServer(QObject):
         reason: str,
         channel: str = "",
         file_size_mb: float = 0,
+        risk_delay: float = 0,
+        rate_level: str = "normal",
+        is_manager: bool = False,
+        hour: int = -1,
+        msg_type: str = "text",
     ) -> str:
         """
         轻量 LLM 调用：生成自然的占位回复文案。
@@ -5750,6 +6091,7 @@ class BridgeServer(QObject):
         - 只给极简 system prompt + 一句话 user prompt
         - 10s 超时兜底（返回硬编码文案）
         - 不入库（占位回复不需要存）
+        - risk_delay: 风控模拟打字等待秒数（0=无）
         """
         FALLBACKS = {
             "file_large": "收到啦～文件有点大，稍等我一下哦～",
@@ -5786,12 +6128,50 @@ class BridgeServer(QObject):
 
             # 🆕 融合版：收集事实描述（不硬给要说的具体词汇）
             facts_parts = []
+            type_cn = {
+                "file": "文件",
+                "image": "图片",
+                "voice": "语音",
+                "video": "视频",
+                "text": "消息",
+                "link": "链接",
+            }.get(msg_type, "消息")
             if reason == "file_large" and file_size_mb > 0:
-                facts_parts.append(f"对方发了一个 {file_size_mb:.1f}MB 的文件")
+                facts_parts.append(f"对方发了一个 {file_size_mb:.1f}MB 的{type_cn}")
             elif reason == "risk_delay_long":
-                facts_parts.append("你需要一点时间整理再回复")
+                if file_size_mb > 0:
+                    facts_parts.append(f"对方发了一个 {file_size_mb:.1f}MB 的{type_cn}")
+                else:
+                    facts_parts.append("对方发了一条消息")
             elif reason == "queue_full":
                 facts_parts.append("你手上还有几条消息在处理")
+
+            rate_cn = {
+                "aggressive": "激进（风控松）",
+                "normal": "正常",
+                "conservative": "保守（风控严）",
+            }.get(rate_level, rate_level)
+            if channel == "wcf":
+                facts_parts.append(f"渠道是微信，风控档位{rate_cn}")
+
+            if hour >= 0:
+                is_night = hour < 6 or hour >= 23
+                if is_night and channel == "wcf":
+                    facts_parts.append(f"现在是凌晨/深夜（{hour}点），微信风控保守")
+                elif hour >= 11 and hour <= 13:
+                    facts_parts.append(f"现在是中午休息时间（{hour}点）")
+                elif hour >= 22 or hour < 7:
+                    facts_parts.append(f"现在是晚上/凌晨（{hour}点）")
+
+            if is_manager:
+                facts_parts.append("对面是老板/管理者，语气可以自然随意")
+            if risk_delay and risk_delay > 5:
+                if risk_delay > 120:
+                    facts_parts.append("你可能要等好几分钟才发正式回复")
+                elif risk_delay > 60:
+                    facts_parts.append("你大概要等一两分钟才发正式回复")
+                else:
+                    facts_parts.append(f"你大概要等 {risk_delay:.0f} 秒才发正式回复")
             facts_str = "；".join(facts_parts) if facts_parts else "你需要一点时间"
 
             messages = [
@@ -5951,16 +6331,18 @@ class BridgeServer(QObject):
                 lines.append(f"  {persona_hint}...")
                 lines.append(f"  → 用这个性格说话，不要变成客服机器人。")
 
-            # 🆕 ▎运营参考（给你参考，不是硬指令）
-            lines.append(f"\n▎运营参考（参考，不是硬指令，你自己判断）")
-            lines.append(f"  · 等的时间要不要主动说一句，你自己根据情况判断")
+            # 🆕 ▎说话参考（给你参考，不是硬指令）
+            lines.append(f"\n▎说话参考（参考，不是硬指令，你自己判断）")
+            lines.append(f"  设想你是一个正常人，对方给你发了点东西，你会怎么反应：")
+            lines.append(f"  · 如果是一两页纸的小文件 → 直接说正事就行，不用特意打招呼")
+            lines.append(f"  · 如果是几十页的文件 → 可以开头说一句'好的，我看看这个'再讲正事")
+            lines.append(f"  · 如果是上百页 → 可以说'内容不少，我仔细看看'")
             if is_manager_peer:
-                lines.append(f"  · 对方是管理者/老板，等待超过几秒值得主动提一句")
-            else:
-                lines.append(f"  · 对方是普通联系人，等待时间短可以不说")
-            lines.append(f"  · 可以在正式回复开头自然带一句，比如'好的，我看看'或'这个内容不少，稍等'")
-            lines.append(f"  · 不要用'系统''后台''处理中'这些技术词")
-            lines.append(f"  · 要不要说、说什么、怎么说——全由你根据自己的性格和上面的事实数据决定")
+                lines.append(f"  · 对方是管理者/老板，他给你发东西可能等着要结果")
+            lines.append(f"  · 不用刻意强调'正在处理'——正常人不会说这种话")
+            lines.append(f"  · 不要用'系统''后台''处理中''排队'这些技术词")
+            lines.append(f"  · 要不要打招呼、怎么打招呼——全由你根据自己的性格和上面的事实决定")
+            lines.append(f"  · 如果看到 [非文本消息: xxx] 开头的内容——这是系统无法自动解析的消息类型（如日程/位置/名片/红包/会议等）——如实告诉对方你看到了什么，但不要承诺去执行你做不到的动作（如改日历、发红包、导航等）")
 
             # ▎全系统概览（只给管理者）
             if is_manager_peer:
@@ -5995,25 +6377,141 @@ class BridgeServer(QObject):
                 except Exception:
                     pass
 
+            try:
+                from storage import agent_app_dao, app_credential_dao
+                from app_registry import APPS
+                agent_id = agent.get("id", "")
+                app_lines_ok = []
+                app_lines_missing = []
+                _bindings = agent_app_dao.list_by_agent(agent_id)
+                _bound_ids = {b["app_id"] for b in _bindings if b.get("enabled")}
+                for _aid in _bound_ids:
+                    _meta = APPS.get(_aid)
+                    if not _meta:
+                        continue
+                    _aud = _meta.get("audience", "both")
+                    if _aud == "manager" and not is_manager_peer:
+                        continue
+                    if _aud == "customer" and is_manager_peer:
+                        continue
+                    _creds_schema = _meta.get("credential_schema") or {}
+                    _required_keys = [f["key"] for f in _creds_schema.get("fields", []) if f.get("required")]
+                    _missing = []
+                    if _required_keys:
+                        for _ck in _required_keys:
+                            _cv = app_credential_dao.get(_ck)
+                            if not (_cv and _cv.get("value")):
+                                _missing.append(_ck)
+                    _label = _meta.get("name", _aid)
+                    _desc = (_meta.get("description") or "").strip()
+                    _usage = (_meta.get("usage") or "").strip().split("\n")[0] if _meta.get("usage") else ""
+                    _one_line = _desc or _usage
+                    if _missing:
+                        app_lines_missing.append(f"⚠️ {_label}（{', '.join(_missing)} 未填，别向用户承诺能用）")
+                    else:
+                        app_lines_ok.append(f"✅ {_label} —— {_one_line[:80]}")
+                if app_lines_ok or app_lines_missing:
+                    lines.append(f"\n▎可用工具（应用市场）")
+                    for _l in app_lines_ok:
+                        lines.append(f"  {_l}")
+                    for _l in app_lines_missing:
+                        lines.append(f"  {_l}")
+                else:
+                    lines.append(f"\n▎可用工具（应用市场）\n  （未启用任何应用）")
+            except Exception as _ae:
+                print(f"[Bridge] 翻译层 · 应用列表构建异常: {_ae}", flush=True)
+
             # ▎角色说明（帮助 LLM 区分说话方式）
             lines.append(f"\n▎角色说明")
             lines.append("- 管理者：本智能体的所有者。他们关心配置、运营、数据，会问规模、配置、知识库相关问题。")
             lines.append("- 普通用户：面向外部的客户。他们不知道你是 AI，不需要技术细节，保持友好自然。")
-
-            # ▎多模态处理原则（纯业务规则，不说模型能力）
-            lines.append(f"\n▎多模态处理原则")
-            lines.append("- 收到图片或视频：尽力处理；如果确实处理不了，坦诚说明即可。")
-            lines.append("- 绝对不要编造内容——说「看不清」「处理不了」比瞎编好一万倍。")
-            if is_manager_peer:
-                lines.append("- 对方是管理者（主人）：说明原因 + 给行动建议。")
-            else:
-                lines.append("- 对方是普通用户：友好说「抱歉我暂时看不了」，建议换文字或截图。")
 
             return "\n".join(lines)
 
         except Exception as e:
             print(f"[Bridge] 翻译层构建异常: {e}", flush=True)
             return None
+
+    def _user_has_any_channel_binding(self, channels):
+        """用户是否绑定了 channels 列表里的至少一个渠道（channel_binding 表）。"""
+        try:
+            from storage.db import get_conn
+            conn = get_conn()
+            rows = conn.execute('SELECT DISTINCT channel FROM channel_binding WHERE is_bound=1').fetchall()
+            bound = {r['channel'] for r in rows}
+            return bool(bound & set(channels))
+        except Exception:
+            return True
+
+    def _dispatch_tool_call(self, tc, agent_id, is_manager_mode):
+        """根据 tool_call 的 name 找到对应的 tool_fn 并执行，返回 JSON string。
+
+        args 自动注入：
+          __tool_name    —— tool 名称（同一个 tool_fn 内部分发多个工具名）
+          __agent_id     —— 智能体 ID
+          __is_manager   —— 当前是否管理者模式
+          __credentials  —— 这个应用的凭据（从 app_credential 表按 credential_schema 过滤）
+          __app_config   —— agent_app 表里的 config_json（应用运行时配置）
+        """
+        import json as _json
+        import importlib
+        from app_registry import APPS
+        from storage import agent_app_dao, app_credential_dao
+        name = tc.get('name', '')
+        try:
+            args_str = tc.get('arguments', '{}')
+            args = _json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
+        except Exception:
+            args = {}
+        for app_id, meta in APPS.items():
+            fn_ref = meta.get('tool_fn')
+            if not fn_ref:
+                continue
+            fn_name = ''
+            def_ref = meta.get('tool_def')
+            def_json = meta.get('tool_def_json')
+            if isinstance(def_json, dict):
+                fn_name = (def_json.get('function') or {}).get('name', '')
+            elif isinstance(def_ref, str):
+                try:
+                    mod_path, attr = def_ref.rsplit(':', 1)
+                    mod = importlib.import_module(mod_path)
+                    real_def = getattr(mod, attr, None)
+                    fn_name = (real_def or {}).get('function', {}).get('name', '') if isinstance(real_def, dict) else ''
+                except Exception:
+                    pass
+            if fn_name != name:
+                continue
+            try:
+                args['__tool_name'] = tc.get('name', '')
+                args['__agent_id'] = agent_id
+                args['__is_manager'] = is_manager_mode
+                cred_schema = meta.get('credential_schema') or {}
+                allowed_keys = {f['key'] for f in cred_schema.get('fields', [])}
+                creds = {}
+                if allowed_keys:
+                    for cred in app_credential_dao.list_all():
+                        if cred['credential_key'] not in allowed_keys:
+                            continue
+                        creds[cred['credential_key']] = cred.get('value', '')
+                args['__credentials'] = creds
+                try:
+                    cfg_row = agent_app_dao.get_config(agent_id, app_id)
+                    args['__app_config'] = cfg_row if isinstance(cfg_row, dict) else {}
+                except Exception:
+                    args['__app_config'] = {}
+                mod_path2, fn_name = fn_ref.rsplit(':', 1)
+                mod2 = importlib.import_module(mod_path2)
+                call_fn = getattr(mod2, fn_name)
+                return call_fn(args)
+            except Exception as _te:
+                import traceback as _tb
+                return _json.dumps({
+                    'ok': False,
+                    'error': f'tool 执行异常: {_te}',
+                    'traceback': _tb.format_exc()[:500],
+                }, ensure_ascii=False)
+        return _json.dumps({'ok': False, 'error': f'未知工具: {name}'}, ensure_ascii=False)
 
     def _handle_send_message(self, payload):
         """发送消息到 LLM，返回完整回复（非流式）。
@@ -6204,8 +6702,7 @@ class BridgeServer(QObject):
         # 免费版闸门 B：未激活的话，即便是改 DB 方式硬塞了 kb_ids 也不会走检索
         _activated = False
         try:
-            _act = activation_dao.get_status()
-            _activated = bool(_act and _act.get("activated"))
+            _activated = self._check_perm("kb")
         except Exception:
             _activated = False
         if use_kb and not _activated:
@@ -6277,57 +6774,116 @@ class BridgeServer(QObject):
             # 纯文本：维持原逻辑
             messages.append({"role": "user", "content": user_input})
 
-        # 7. 调用 LLM
+        # 7. 调用 LLM（支持 function calling）
+        tool_defs = []
         try:
+            from storage import agent_app_dao, app_credential_dao
+            from app_registry import APPS
+            import importlib
+            import json as _json
+            bindings = agent_app_dao.list_by_agent(agent_id)
+            bound_app_ids = {b["app_id"] for b in bindings if b.get("enabled")}
+            for app_id in bound_app_ids:
+                global_row = app_credential_dao.get(f"app_enabled_{app_id}")
+                global_ok = bool(global_row and global_row.get("value") == "1")
+                if not global_ok:
+                    continue
+                app_meta = APPS.get(app_id)
+                if not app_meta:
+                    continue
+                audience = app_meta.get("audience", "both")
+                if audience == "manager" and not is_manager_mode:
+                    continue
+                if audience == "customer" and is_manager_mode:
+                    continue
+                if len(tool_defs) >= 20:
+                    print(f"[Bridge] ⚠️ FC 护栏：tool 数量已达上限 20，跳过 app={app_id}", flush=True)
+                    continue
+                app_channels = app_meta.get("channels") or []
+                if app_channels and not _user_has_any_channel_binding(app_channels):
+                    print(f"[Bridge] ⚠️ FC 护栏：用户未绑定 app={app_id} 所需的任何渠道，跳过", flush=True)
+                    continue
+                tool_def_ref = app_meta.get("tool_def")
+                tool_def_json = app_meta.get("tool_def_json")
+                if isinstance(tool_def_json, dict):
+                    td_chars = len(json.dumps(tool_def_json, ensure_ascii=False))
+                    if td_chars > 2000:
+                        print(f"[Bridge] ⚠️ FC 护栏：app={app_id} tool_def 过大 ({td_chars} chars)，跳过", flush=True)
+                        continue
+                    tool_defs.append(tool_def_json)
+                elif isinstance(tool_def_json, list):
+                    for td in tool_def_json:
+                        if len(json.dumps(td, ensure_ascii=False)) > 2000:
+                            print(f"[Bridge] ⚠️ FC 护栏：app={app_id} 某个 tool_def 过大，跳过", flush=True)
+                            continue
+                        tool_defs.append(td)
+                elif isinstance(tool_def_ref, str):
+                    try:
+                        mod_path, fn = tool_def_ref.rsplit(":", 1)
+                        mod = importlib.import_module(mod_path)
+                        obj = getattr(mod, fn)
+                        if isinstance(obj, (list, tuple)):
+                            tool_defs.extend(obj)
+                        else:
+                            tool_defs.append(obj)
+                    except Exception as _te:
+                        print(f"[Bridge] tool_def 加载失败 app={app_id}: {_te}", flush=True)
+            if tool_defs:
+                print(f"[Bridge] 注入 {len(tool_defs)} 个 tools: {[t.get('function', {}).get('name', '?') for t in tool_defs]} agent={agent.get('name', '?')}", flush=True)
+        except Exception as _e:
+            print(f"[Bridge] tool 收集异常: {_e}", flush=True)
+
+        try:
+            import time as _time
             provider = LLMProvider.from_config(llm_cfg)
-            result = provider.chat(messages, temperature=0.7)
+            max_tool_loops = 3 if tool_defs else 0
+            _fc_deadline = _time.time() + 60
+            _used_tools = set()
+            loop = 0
+            result = None
+            final_text = ""
+            while loop <= max_tool_loops:
+                if _time.time() > _fc_deadline:
+                    print(f"[Bridge] ⚠️ FC 循环超时（60s），强制 break，当前 loop={loop}", flush=True)
+                    result = {"error": "AI 处理超时，请稍后重试（或换个更短的问题）"}
+                    break
+                result = provider.chat(messages, temperature=0.7,
+                                       tools=tool_defs if loop == 0 else None)
+                if result.get("error"):
+                    break
+                tcs = result.get("tool_calls") or []
+                if not tcs:
+                    final_text = (result.get("text") or "").strip()
+                    break
+                loop += 1
+                for tc in tcs:
+                    _used_tools.add(tc.get("name", ""))
+                assistant_msg = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": tc["id"], "type": "function",
+                         "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                        for tc in tcs
+                    ],
+                }
+                messages.append(assistant_msg)
+                for tc in tcs:
+                    tool_result = self._dispatch_tool_call(tc, agent_id, is_manager_mode)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["name"],
+                        "content": tool_result,
+                    })
+                    print(f"[Bridge] tool_call: {tc['name']} → {tool_result[:120]}", flush=True)
+                if loop > max_tool_loops:
+                    result = {"error": "function calling 达到最大循环次数"}
+                    break
+            loop = 0
 
             if result.get("error"):
-                # ★ 多模态降级：检测是不是模型不支持图片/视频
-                raw_err = result["error"]
-                friendly_err = raw_err
-                if media_list:
-                    low_err = raw_err.lower()
-                    # 常见 vision 不支持的 error 关键词
-                    _VISION_UNSUPPORTED_KEYS = [
-                        "image_url", "vision", "multimodal", "multi-modal",
-                        "image input", "image analysis", "不支持图片",
-                        "invalid_request_error", "unsupported",
-                        "does not support", "cannot process",
-                        "image_url is not", "image input is not",
-                    ]
-                    if any(k in low_err for k in _VISION_UNSUPPORTED_KEYS):
-                        # 根据 media 类型给更精准的提示
-                        has_img = any(m.get("type","") == "image" for m in media_list)
-                        has_vid = any(m.get("type","") == "video" for m in media_list)
-                        media_cn = "视频" if has_vid else ("图片" if has_img else "内容")
-
-                        # ★ 纯业务规则，不说模型名（LLM 自己知道）
-                        if is_manager_peer:
-                            if has_vid and not has_img:
-                                friendly_err = (
-                                    f"主人，我暂时处理不了视频。\n"
-                                    f"两个办法：\n"
-                                    f"1. 在「智能体配置 → LLM」里换一个支持视频的模型；\n"
-                                    f"2. 让用户截图关键帧后重发图片。"
-                                )
-                            else:
-                                friendly_err = (
-                                    f"主人，我暂时处理不了{media_cn}。\n"
-                                    f"在「智能体配置 → LLM」里换个模型试试。"
-                                )
-                        else:
-                            if has_vid and not has_img:
-                                friendly_err = (
-                                    f"抱歉哦，我目前看不了视频～可以试试截图关键帧发给我，"
-                                    f"或者直接用文字说也行！"
-                                )
-                            else:
-                                friendly_err = f"抱歉哦，我目前还没法看{media_cn}，发文字告诉我就行啦～"
-
-                        print(f"[Bridge] ★ vision 不支持降级: media={media_cn} is_manager={is_manager_peer}", flush=True)
-
-                # LLM 调用失败，保存错误消息（降级提示或原始错误）
+                friendly_err = result["error"]
+                # LLM 调用失败，保存错误消息
                 err_msg = f"[错误] {friendly_err}"
                 assistant_msg = msg_dao.create(
                     conv_id, "assistant", err_msg,
@@ -6343,7 +6899,7 @@ class BridgeServer(QObject):
                     "assistant_message": assistant_msg,
                 }
 
-            reply_text = result.get("text", "") or "（空回复）"
+            reply_text = final_text or "（空回复）"
 
             # AIGC 标识：末尾追加纯中文括号文本「（AI 生成内容）」
             # 微信只支持纯文本，不能带 HTML 图标或彩色标记
@@ -6355,6 +6911,9 @@ class BridgeServer(QObject):
 
             usage = result.get("usage", {})
             tokens_used = int((usage.get("total_tokens") or 0))
+            _source_tag = ""
+            if _used_tools:
+                _source_tag = "tool:" + ",".join(sorted(_used_tools))
 
             # 保存 AI 回复
             assistant_msg = msg_dao.create(
@@ -6363,6 +6922,7 @@ class BridgeServer(QObject):
                 aigc_marked=1 if aigc_enabled else 0,
                 channel=channel,
                 model=llm_cfg.get("model", ""),
+                source_tag=_source_tag,
             )
 
             # 更新会话标题（如果还是空的）
@@ -6658,6 +7218,134 @@ class BridgeServer(QObject):
             "total_messages": total_messages,
             "peer_name": peer_name,
             "agent_name": agent_name,
+        }
+
+    def _handle_prepare_feedback_package(self, payload):
+        """打包 zip（日志 + 系统信息 + 用户表单 + 截图），返回 zip 路径 + mailto URL。"""
+        import zipfile
+        import io
+        import platform
+        import base64
+        from pathlib import Path
+        from datetime import datetime
+
+        APP_VERSION = "1.0.0"
+        FEEDBACK_EMAIL = "14584407@qq.com"
+
+        try:
+            from logger import get_log_dir
+            log_dir = Path(get_log_dir())
+        except Exception:
+            log_dir = Path.home() / ".appdata" / "SCAI" / "logs"
+
+        system_info = {
+            "app_version": APP_VERSION,
+            "os": platform.system(),
+            "os_version": platform.version(),
+            "machine": platform.machine(),
+            "python_version": platform.python_version(),
+            "feedback_time": datetime.now().isoformat(),
+        }
+
+        channels_status = {}
+        try:
+            channels_status["wecom"] = bool(self.wecom_client and self.wecom_client.connected)
+        except Exception:
+            pass
+        try:
+            channels_status["feishu"] = bool(self.feishu_client and self.feishu_client.connected)
+        except Exception:
+            pass
+        try:
+            channels_status["dingtalk"] = bool(self.dingtalk_client and self.dingtalk_client.connected)
+        except Exception:
+            pass
+        try:
+            channels_status["wcf"] = bool(self.wcf_client and self.wcf_client.connected)
+        except Exception:
+            pass
+        try:
+            channels_status["oa"] = bool(self.oa_client and self.oa_client.connected)
+        except Exception:
+            pass
+
+        feedback_data = {
+            "type": payload.get("type", "other"),
+            "subject": payload.get("subject", "(无主题)"),
+            "description": payload.get("description", ""),
+            "contact": payload.get("contact", ""),
+            "channels": channels_status,
+            "screenshots_count": len(payload.get("screenshots") or []),
+        }
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path.home() / "Desktop"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = out_dir / f"SCAI_feedback_{timestamp}.zip"
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+
+                zf.writestr("system_info.json", json.dumps(system_info, ensure_ascii=False, indent=2))
+
+                zf.writestr("feedback.json", json.dumps(feedback_data, ensure_ascii=False, indent=2))
+
+                if log_dir.exists():
+                    for log_file in sorted(log_dir.glob("scai_*.log")):
+                        try:
+                            zf.write(log_file, f"logs/{log_file.name}")
+                        except Exception:
+                            pass
+
+                screenshots = payload.get("screenshots") or []
+                for idx, shot in enumerate(screenshots):
+                    try:
+                        name = shot.get("name", f"screenshot_{idx}.png")
+                        data_url = shot.get("data", "")
+                        if data_url.startswith("data:"):
+                            b64 = data_url.split(",", 1)[1]
+                        else:
+                            b64 = data_url
+                        img_bytes = base64.b64decode(b64)
+                        zf.writestr(f"screenshots/{idx}_{name}", img_bytes)
+                    except Exception:
+                        pass
+        except Exception as e:
+            raise RuntimeError(f"打包日志失败: {e}")
+
+        try:
+            subject_line = f"[SCAI反馈] {feedback_data['subject']}"
+            body_lines = [
+                f"问题类型：{payload.get('type', 'other')}",
+                f"主题：{feedback_data['subject']}",
+                f"联系方式：{feedback_data['contact'] or '未填写'}",
+                f"截图：{feedback_data['screenshots_count']} 张（在 zip 里）",
+                "",
+                "--- 详细描述 ---",
+                feedback_data["description"],
+                "",
+                "--- 系统信息 ---",
+                f"App: {APP_VERSION}  OS: {platform.system()} {platform.version()[:30]}",
+                f"渠道: {channels_status}",
+                "",
+                f"📎 诊断日志已打包在：{zip_path}",
+                "请将此 zip 文件作为附件添加到邮件中发送。",
+            ]
+            body_text = "\r\n".join(body_lines)
+
+            import urllib.parse
+            mailto_url = (
+                f"mailto:{FEEDBACK_EMAIL}?subject={urllib.parse.quote(subject_line)}"
+                f"&body={urllib.parse.quote(body_text)}"
+            )
+        except Exception:
+            mailto_url = f"mailto:{FEEDBACK_EMAIL}"
+
+        print(f"[Bridge][prepare_feedback_package] zip={zip_path}", flush=True)
+        return {
+            "ok": True,
+            "zip_path": str(zip_path),
+            "mailto_url": mailto_url,
         }
 
     # ---------- 导出知识库（OKF / LLM Wiki 格式 zip） ----------
@@ -7008,4 +7696,250 @@ class BridgeServer(QObject):
             "nodes": len(nodes),
             "edges": len(edges),
         }
+
+    # ---------- 应用市场 ----------
+    def _handle_list_apps(self, payload):
+        import importlib, app_registry as _ar
+        importlib.reload(_ar)
+        from storage import app_credential_dao
+        apps = []
+        for app_meta in _ar.list_apps():
+            app_id = app_meta['id']
+            # 全局开关
+            row = app_credential_dao.get(f'app_enabled_{app_id}')
+            enabled = row and row.get('value') == '1'
+            # 凭据是否已配置
+            cred_fields = (app_meta.get('credential_schema') or {}).get('fields') or []
+            configured = False
+            for f in cred_fields:
+                if app_credential_dao.get(f['key']):
+                    configured = True
+                    break
+            apps.append({**app_meta, 'enabled': enabled, 'configured': configured})
+        return {'ok': True, 'apps': apps}
+
+    def _handle_toggle_agent_app(self, payload):
+        import importlib
+        from app.app_registry import app_registry as _ar
+        importlib.reload(_ar)
+        from storage import app_credential_dao, agent_app_dao
+        agent_id = payload.get('agent_id')
+        app_id = payload.get('app_id')
+        enabled = bool(payload.get('enabled', True))
+        if not app_id:
+            raise ValueError('缺少 app_id')
+        if app_id not in _ar.APPS:
+            raise ValueError(f'未知应用: {app_id}')
+        # agent_id == '__global__' 表示操作全局开关
+        if not agent_id or agent_id == '__global__':
+            app_credential_dao.save(f'app_enabled_{app_id}', '1' if enabled else '0')
+            return {'ok': True, 'scope': 'global', 'app_id': app_id, 'enabled': enabled}
+        agent_app_dao.toggle(agent_id, app_id, enabled)
+        return {'ok': True, 'scope': 'agent', 'agent_id': agent_id, 'app_id': app_id, 'enabled': enabled}
+
+    def _handle_save_app_credentials(self, payload):
+        from storage import app_credential_dao
+        app_id = payload.get('app_id')
+        credentials = payload.get('credentials') or {}
+        if not app_id:
+            raise ValueError('缺少 app_id')
+        if app_id not in APPS:
+            raise ValueError(f'未知应用: {app_id}')
+        saved = {}
+        for key, value in credentials.items():
+            app_credential_dao.save(key, value or '')
+            saved[key] = True
+        return {'ok': True, 'app_id': app_id, 'saved': list(saved.keys())}
+
+    def _handle_get_app_credentials(self, payload):
+        from storage import app_credential_dao
+        app_id = payload.get('app_id')
+        if not app_id:
+            raise ValueError('缺少 app_id')
+        app_meta = get_app(app_id)
+        if not app_meta:
+            raise ValueError(f'未知应用: {app_id}')
+        allowed_keys = {f['key'] for f in app_meta.get('credential_schema', {}).get('fields', [])}
+        result = {}
+        for cred in app_credential_dao.list_all():
+            if cred['credential_key'] not in allowed_keys:
+                continue
+            result[cred['credential_key']] = cred.get('value', '')
+        return {'ok': True, 'app_id': app_id, 'credentials': result}
+
+    def _handle_run_app_test(self, payload):
+        import importlib
+        app_id = payload.get('app_id')
+        if not app_id:
+            raise ValueError('缺少 app_id')
+        app_meta = get_app(app_id)
+        if not app_meta:
+            raise ValueError(f'未知应用: {app_id}')
+        test_fn_path = app_meta.get('test_fn')
+        if not test_fn_path:
+            return {'ok': True, 'app_id': app_id, 'tested': False, 'message': '此应用暂无连通性测试'}
+        try:
+            mod_path, fn_name = test_fn_path.rsplit(':', 1)
+            mod = importlib.import_module(mod_path)
+            test_fn = getattr(mod, fn_name)
+            result = test_fn()
+            return {'ok': True, 'app_id': app_id, 'result': result}
+        except ImportError as e:
+            return {'ok': False, 'app_id': app_id, 'error': f'测试模块未就绪: {e}'}
+        except Exception as e:
+            return {'ok': False, 'app_id': app_id, 'error': str(e)}
+
+    def _handle_run_app_once(self, payload):
+        import importlib
+        app_id = payload.get('app_id')
+        if not app_id:
+            raise ValueError('缺少 app_id')
+        app_meta = get_app(app_id)
+        if not app_meta:
+            raise ValueError(f'未知应用: {app_id}')
+        runner_fn_path = app_meta.get('runner_fn')
+        if not runner_fn_path:
+            return {'ok': False, 'app_id': app_id, 'error': '此应用暂无 runner'}
+        try:
+            mod_path, fn_name = runner_fn_path.rsplit(':', 1)
+            mod = importlib.import_module(mod_path)
+            runner_fn = getattr(mod, fn_name)
+            context = payload.get('context') or {}
+            keywords = payload.get('keywords') or context.get('keywords') or []
+            result = runner_fn(context)
+            items = []
+            if isinstance(result, dict):
+                items = result.get('items') or []
+            brief = []
+            for it in items:
+                brief.append({
+                    'title': it.get('title', ''),
+                    'platform': it.get('platform', ''),
+                    'price': it.get('price'),
+                    'commission_rate': it.get('commission_rate'),
+                    'score': it.get('score'),
+                })
+            return {
+                'ok': True,
+                'app_id': app_id,
+                'count': len(items),
+                'total_searched': result.get('total_searched', 0) if isinstance(result, dict) else 0,
+                'note': result.get('note', '') if isinstance(result, dict) else '',
+                'items': brief,
+            }
+        except ImportError as e:
+            return {'ok': False, 'app_id': app_id, 'error': f'runner 模块未就绪: {e}'}
+        except Exception as e:
+            import traceback
+            return {'ok': False, 'app_id': app_id, 'error': f'{type(e).__name__}: {e}'}
+
+    def _handle_get_mcp_config(self, payload):
+        from mcp_manager import get_mcp_manager
+        return get_mcp_manager().get_config()
+
+    def _handle_set_mcp_config(self, payload):
+        from mcp_manager import get_mcp_manager
+        mgr = get_mcp_manager()
+        enabled = bool(payload.get('enabled', False))
+        mgr.set_enabled(enabled)
+        if enabled:
+            mgr.get_or_generate_token()
+            self._ensure_mcp_thread_running()
+        else:
+            self._stop_mcp_thread()
+        return mgr.get_config()
+
+    def _ensure_mcp_thread_running(self):
+        """启动 MCP server 子进程（stdio 模式，供外部 Trae 连接）。"""
+        import os as _os
+        import subprocess
+        from mcp_manager import get_mcp_manager
+        mgr = get_mcp_manager()
+        if not mgr.is_enabled():
+            return
+        # frozen（PyInstaller）模式下无独立 python 解释器可用，禁用 MCP server
+        if getattr(sys, "frozen", False):
+            print("[MCP] frozen 模式禁用 MCP server（开发版功能）", flush=True)
+            self._mcp_process = None
+            return
+        token = mgr.get_or_generate_token()
+        # 已启动则跳过
+        if getattr(self, "_mcp_process", None) is not None:
+            return
+        env = _os.environ.copy()
+        env["MCP_TOKEN"] = token
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", "-m", "app.mcp_server"],
+                env=env,
+                cwd=str(Path(__file__).parent.parent),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._mcp_process = proc
+            print(f"[MCP] server 已启动 PID={proc.pid}, token={token[:8]}...", flush=True)
+        except Exception as e:
+            print(f"[MCP] 启动失败: {e}", flush=True)
+            self._mcp_process = None
+
+    def _stop_mcp_thread(self):
+        if getattr(self, "_mcp_process", None) is not None:
+            try:
+                self._mcp_process.terminate()
+                self._mcp_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._mcp_process.kill()
+                except Exception:
+                    pass
+            self._mcp_process = None
+            print("[MCP] server 已停止", flush=True)
+
+    def _handle_get_agent_apps(self, payload):
+        import json as _json
+        from storage import agent_app_dao, app_credential_dao
+        from app_registry import APPS
+        agent_id = payload.get('agent_id')
+        if not agent_id:
+            raise ValueError('缺少 agent_id')
+        bindings = {b['app_id']: b for b in agent_app_dao.list_by_agent(agent_id)}
+        result = []
+        for app_id, app_meta in APPS.items():
+            # 全局开关：必须全局启用才对智能体可见
+            global_row = app_credential_dao.get(f'app_enabled_{app_id}')
+            global_enabled = bool(global_row and global_row.get('value') == '1')
+            if not global_enabled:
+                continue
+            b = bindings.get(app_id)
+            agent_enabled = bool(b.get('enabled', 0)) if b else False
+            config_json = b.get('config_json') or '{}' if b else '{}'
+            try:
+                runtime_config = _json.loads(config_json)
+            except Exception:
+                runtime_config = {}
+            result.append({
+                'app_id': app_id,
+                'name': app_meta['name'],
+                'icon': app_meta.get('icon', '📦'),
+                'description': app_meta.get('description', ''),
+                'version': app_meta.get('version', '1.0.0'),
+                'enabled': agent_enabled,
+                'credential_schema': app_meta.get('credential_schema', {}),
+                'runtime_schema': app_meta.get('runtime_schema', {}),
+                'runtime_config': runtime_config,
+            })
+        return {'ok': True, 'agent_id': agent_id, 'apps': result}
+
+    def _handle_save_agent_app_config(self, payload):
+        import json as _json
+        from storage import agent_app_dao
+        agent_id = payload.get('agent_id')
+        app_id = payload.get('app_id')
+        config = payload.get('config') or {}
+        if not agent_id or not app_id:
+            raise ValueError('缺少 agent_id 或 app_id')
+        config_json = _json.dumps(config, ensure_ascii=False)
+        agent_app_dao.upsert(agent_id, app_id, enabled=True, config_json=config_json)
+        return {'ok': True, 'agent_id': agent_id, 'app_id': app_id}
 

@@ -561,6 +561,10 @@ def get_app(app_id: str) -> dict | None:
 
 
 def list_apps(category: str | None = None, include_hidden: bool = False) -> list[dict]:
+    """返回所有应用（按 category 可选过滤），默认过滤 hidden_in_mvp 的应用。
+
+    include_hidden=True 时返回全量（给 MCP / bridge 内部用）。
+    """
     apps = list(APPS.values())
     if not include_hidden:
         apps = [a for a in apps if not a.get("hidden_in_mvp")]

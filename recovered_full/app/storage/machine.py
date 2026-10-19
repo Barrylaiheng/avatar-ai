@@ -19,24 +19,22 @@ import uuid
 _CACHED_CODE: str | None = None
 
 
-def _run_powershell(cmd: str, timeout: float = 3.0) -> str:
-    """执行 PowerShell 命令，返回 stdout（去空白）。失败返回空串。"""
+def _run_powershell(cmd: str, timeout: float = 5.0) -> str:
+    """执行 PowerShell 命令，返回 stdout（去空白）。失败返回空串。
+
+    用 CREATE_NO_WINDOW 阻止任何黑框弹出（PyInstaller打包后更关键）。
+    """
     try:
         # 创建子进程，无窗口，避免弹出黑框
-        startupinfo = None
-        try:
-            import subprocess as _sp
-            startupinfo = _sp.STARTUPINFO()
-            startupinfo.dwFlags |= _sp.STARTF_USESHOWWINDOW
-        except Exception:
-            pass
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = 134217728  # CREATE_NO_WINDOW
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
             capture_output=True, text=True, timeout=timeout,
-            startupinfo=startupinfo,
+            startupinfo=startupinfo, creationflags=creationflags,
         )
-        out = (result.stdout or "").strip()
-        return out
+        return (result.stdout or "").strip()
     except Exception:
         return ""
 
@@ -44,26 +42,25 @@ def _run_powershell(cmd: str, timeout: float = 3.0) -> str:
 def _fetch_hardware_fingerprint() -> str:
     """收集硬件指纹原始字符串（拼接多个来源）。
 
-    每个来源单独 try，任意一个失败不影响其他。
+    一次 PowerShell 调用拉 3 个硬件字段，用 | 分隔返回。
     """
     parts: list[str] = []
 
-    # 来源 1：主板产品 UUID（Get-CimInstance 替代已废弃的 wmic）
-    uuid_val = _run_powershell(
-        "(Get-CimInstance Win32_ComputerSystemProduct).UUID"
+    # 来源：主板 UUID / CPU ProcessorId / BIOS 序列号（一次拉取）
+    output = _run_powershell(
+        '$u = (Get-CimInstance Win32_ComputerSystemProduct).UUID; $c = (Get-CimInstance Win32_Processor).ProcessorId; $b = (Get-CimInstance Win32_BIOS).SerialNumber; Write-Output "$u|$c|$b"'
     )
-    if uuid_val and uuid_val.upper() != "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF":
-        parts.append("uuid:" + uuid_val)
 
-    # 来源 2：CPU ProcessorId
-    cpu_id = _run_powershell("(Get-CimInstance Win32_Processor).ProcessorId")
-    if cpu_id:
-        parts.append("cpu:" + cpu_id)
-
-    # 来源 3：BIOS 序列号
-    bios_sn = _run_powershell("(Get-CimInstance Win32_BIOS).SerialNumber")
-    if bios_sn:
-        parts.append("bios:" + bios_sn)
+    # 解析：| 分隔
+    fields = output.split("|") if output else []
+    if len(fields) >= 1:
+        uuid_val = fields[0].strip()
+        if uuid_val and uuid_val.upper() != "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF":
+            parts.append("uuid:" + uuid_val)
+    if len(fields) >= 2 and fields[1].strip():
+        parts.append("cpu:" + fields[1].strip())
+    if len(fields) >= 3 and fields[2].strip():
+        parts.append("bios:" + fields[2].strip())
 
     # 降级来源：MAC 地址 + CPU 型号字符串 + 主机名
     if not parts:

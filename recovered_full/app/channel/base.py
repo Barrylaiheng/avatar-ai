@@ -29,6 +29,7 @@ class ChannelMessage:
     msg_type: str = "text"            # 消息类型：text / voice / image / video / file / emoji / location / other
     is_self: bool = False             # 是否自己发的（过滤掉）
     is_at: bool = False               # 群里是否 @我
+    is_at_all: bool = False           # 群里是否 @所有人
     ts_ms: int = 0                    # 毫秒时间戳
     # ===== 非文本消息扩展字段 =====
     file_path: str = ""               # 本地文件路径（file / voice / image / video 落地后填）
@@ -37,6 +38,8 @@ class ChannelMessage:
     media_url: str = ""               # base64 data URL（image/video 预处理后填，格式 data:mime;base64,xxx）
     file_size: int = 0                # 🆕 字节数，0=未知（各渠道归一化填）
     is_ready: bool = False            # 🆕 文件是否已下载就绪
+    open_conversation_id: str = ""    # 开放平台（视频号等）会话 id
+    open_message_id: str = ""         # 开放平台消息 id
 
 
 @runtime_checkable

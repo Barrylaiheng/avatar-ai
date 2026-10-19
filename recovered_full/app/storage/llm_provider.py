@@ -180,11 +180,13 @@ class LLMProvider:
         messages: list[dict],
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        tools: list[dict] | None = None,
     ) -> dict:
         """非流式对话，返回完整结果。
 
-        返回 {text, finish_reason, usage, error}
-        成功 error=""，失败 error 非空。
+        返回 {text, finish_reason, usage, error, tool_calls}
+        success: error=""
+        function calling: tool_calls = [{id, name, arguments_json}]
         """
         body_dict: dict = {
             "model": self.model,
@@ -194,6 +196,9 @@ class LLMProvider:
         }
         if max_tokens is not None:
             body_dict["max_tokens"] = max_tokens
+        if tools:
+            body_dict["tools"] = tools
+            body_dict["tool_choice"] = "auto"
         body = json.dumps(body_dict, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             _build_chat_url(self.base_url),
@@ -210,12 +215,24 @@ class LLMProvider:
                 data = json.loads(raw)
                 if "error" in data:
                     return {"text": "", "finish_reason": "",
-                            "usage": {}, "error": data["error"].get("message", "")}
+                            "usage": {}, "tool_calls": [],
+                            "error": data["error"].get("message", "")}
                 choice = (data.get("choices") or [{}])[0]
+                msg = choice.get("message", {})
+                tool_calls_raw = msg.get("tool_calls") or []
+                tool_calls = []
+                for tc in tool_calls_raw:
+                    fn = tc.get("function", {})
+                    tool_calls.append({
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "arguments": fn.get("arguments", "{}"),
+                    })
                 return {
-                    "text": choice.get("message", {}).get("content", ""),
+                    "text": msg.get("content", ""),
                     "finish_reason": choice.get("finish_reason", ""),
                     "usage": data.get("usage", {}),
+                    "tool_calls": tool_calls,
                     "error": "",
                 }
         except urllib.error.HTTPError as e:
@@ -225,9 +242,9 @@ class LLMProvider:
                 reason = err_json.get("error", {}).get("message", reason)
             except Exception:
                 pass
-            return {"text": "", "finish_reason": "", "usage": {}, "error": reason}
+            return {"text": "", "finish_reason": "", "usage": {}, "tool_calls": [], "error": reason}
         except Exception as e:
-            return {"text": "", "finish_reason": "", "usage": {}, "error": str(e)}
+            return {"text": "", "finish_reason": "", "usage": {}, "tool_calls": [], "error": str(e)}
 
     # ---------- SSE 流式 ----------
     def chat_stream(

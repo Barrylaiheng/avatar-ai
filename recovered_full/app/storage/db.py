@@ -298,6 +298,42 @@ _TABLES: dict[str, dict[str, str]] = {
         "updated_at":   "INTEGER NOT NULL DEFAULT 0",
         "__idx_peer_profile_uniq": "UNIQUE (channel, peer_id)",
     },
+
+    # ===== APP 应用集成（新增表）=====
+    **{
+        # 智能体已安装的 APP（app_id 对应开放平台应用）
+        "agent_app": {
+            "agent_id":     "TEXT NOT NULL REFERENCES ai_agent(id) ON DELETE CASCADE",
+            "app_id":       "TEXT NOT NULL",
+            "enabled":      "INTEGER NOT NULL DEFAULT 1",
+            "config_json":  "TEXT NOT NULL DEFAULT '{}'",
+            "installed_at": "INTEGER NOT NULL",
+            "updated_at":   "INTEGER NOT NULL",
+            "__idx_agent_app_pk": "PRIMARY KEY (agent_id, app_id)",
+        },
+        # APP 凭据（单行键值对）
+        "app_credential": {
+            "credential_key": "TEXT PRIMARY KEY",
+            "value":          "TEXT NOT NULL DEFAULT ''",
+            "updated_at":     "INTEGER NOT NULL",
+        },
+        # 定时任务（APP 驱动的定时内容投放）
+        "scheduled_job": {
+            "job_id":           "TEXT PRIMARY KEY",
+            "app_id":           "TEXT NOT NULL DEFAULT ''",
+            "agent_id":         "TEXT NOT NULL REFERENCES ai_agent(id) ON DELETE CASCADE",
+            "name":             "TEXT NOT NULL",
+            "cron_expr":        "TEXT NOT NULL",
+            "content_template": "TEXT NOT NULL",
+            "target_json":      "TEXT NOT NULL",
+            "timezone":         "TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
+            "enabled":          "INTEGER NOT NULL DEFAULT 1",
+            "last_run_at":      "INTEGER",
+            "next_run_at":      "INTEGER",
+            "created_at":       "INTEGER NOT NULL",
+            "updated_at":       "INTEGER NOT NULL",
+        },
+    },
 }
 
 

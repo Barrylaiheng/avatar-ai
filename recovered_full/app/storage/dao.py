@@ -210,15 +210,16 @@ class AgentsDAO:
             data.get("content_formats") or '{"text":true,"voice":true,"image":false,"video":false,"file":false}',
             channel,
         )
+        active = 1 if data.get("active", 1) else 0
         ts = now_ts()
         with transaction():
             conn.execute(
                 """INSERT INTO ai_agent
                    (id, name, avatar, description, system_prompt, agent_type, style, memories,
-                    aigc_enabled, emoji_enabled, non_text_notice, llm_config_id, kb_ids, kb_enabled, rate_profile, channel, content_formats, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    aigc_enabled, emoji_enabled, non_text_notice, llm_config_id, kb_ids, kb_enabled, rate_profile, channel, content_formats, active, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (aid, name, avatar, description, system_prompt, agent_type, style, memories,
-                 aigc_enabled, emoji_enabled, non_text_notice, llm_config_id, kb_ids, kb_enabled, rate_profile, channel, content_formats, ts, ts),
+                 aigc_enabled, emoji_enabled, non_text_notice, llm_config_id, kb_ids, kb_enabled, rate_profile, channel, content_formats, active, ts, ts),
             )
         return self.get(aid)
 
@@ -241,7 +242,7 @@ class AgentsDAO:
             "name", "avatar", "description", "system_prompt", "agent_type", "style",
             "memories", "aigc_enabled", "emoji_enabled", "llm_config_id", "kb_ids",
             "kb_enabled", "rate_profile", "last_memory_refine_at", "oa_auto_enable",
-            "non_text_notice", "channel", "content_formats",
+            "non_text_notice", "channel", "content_formats", "active",
         }
         for k, v in data.items():
             if k not in allow_keys:
@@ -249,7 +250,7 @@ class AgentsDAO:
             sets.append(f'"{k}" = ?')
             if k in ("kb_ids", "rate_profile") and isinstance(v, (list, dict, tuple)):
                 args.append(json.dumps(v, ensure_ascii=False))
-            elif k in ("aigc_enabled", "emoji_enabled", "oa_auto_enable", "non_text_notice"):
+            elif k in ("aigc_enabled", "emoji_enabled", "oa_auto_enable", "non_text_notice", "kb_enabled", "active"):
                 args.append(1 if v else 0)
             else:
                 args.append(v)
@@ -307,7 +308,17 @@ class AgentsDAO:
                 conn.execute("DELETE FROM peer_profile WHERE agent_id = ?", (agent_id,))
             except Exception:
                 pass  # peer_profile 没 agent_id 字段就跳过
-            # 5) 最后删 ai_agent 本体
+            # 5) 清 agent_app 关联（表或字段不存在时兜底跳过）
+            try:
+                conn.execute("DELETE FROM agent_app WHERE agent_id = ?", (agent_id,))
+            except Exception:
+                pass
+            # 6) 清 scheduled_job 关联（表或字段不存在时兜底跳过）
+            try:
+                conn.execute("DELETE FROM scheduled_job WHERE agent_id = ?", (agent_id,))
+            except Exception:
+                pass
+            # 7) 最后删 ai_agent 本体
             cur = conn.execute("DELETE FROM ai_agent WHERE id = ?", (agent_id,))
             return cur.rowcount > 0
 
@@ -1326,7 +1337,7 @@ class ChatMessageDAO:
 
     def create(self, conversation_id: str, role: str, content: str,
                tokens: int = 0, aigc_marked: int = 0,
-               channel: str = "wcf", model: str = "") -> dict:
+               channel: str = "wcf", model: str = "", source_tag: str = "") -> dict:
         conn = get_conn()
         mid = new_id("msg")
         ts = now_ts()
@@ -1334,10 +1345,10 @@ class ChatMessageDAO:
             conn.execute(
                 """INSERT INTO chat_message
                    (id, conversation_id, role, content, tokens, aigc_marked,
-                    channel, model, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    channel, model, source_tag, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (mid, conversation_id, role, content, tokens, aigc_marked,
-                 channel, model, ts),
+                 channel, model, source_tag, ts),
             )
             # 同步会话 updated_at + message_count 冗余计数
             conn.execute(
@@ -1364,6 +1375,24 @@ class ChatMessageDAO:
                 'DELETE FROM chat_message WHERE conversation_id = ?', (conv_id,)
             )
             return cur.rowcount
+
+    def list_recent_by_agent(self, agent_id: str, hours: int = 24,
+                             limit: int = 200) -> list[dict]:
+        """拉取某 agent 最近 N 小时的所有渠道消息（user + assistant）。"""
+        import time
+        since = int(time.time() - hours * 3600)
+        rows = get_conn().execute(
+            """SELECT cm.*, c.channel, c.peer_name
+               FROM chat_message cm
+               JOIN conversation c ON cm.conversation_id = c.id
+               WHERE c.agent_id = ?
+                 AND cm.created_at >= ?
+                 AND cm.content IS NOT NULL
+               ORDER BY cm.created_at DESC
+               LIMIT ?""",
+            (agent_id, since, limit),
+        ).fetchall()
+        return rows_to_dict_list(rows)
 
 
 RISK_CONFIG_SINGLETON = "singleton"
@@ -1418,3 +1447,110 @@ class RiskConfigDAO:
                 vals,
             )
         return self.get()
+
+
+# ====== 智能体 × 应用（多对多） ======
+class AgentAppDAO:
+    """多对多表：哪个智能体启用了哪个应用 + 运行时配置（JSON）"""
+
+    def list_by_agent(self, agent_id: str) -> list[dict]:
+        rows = get_conn().execute(
+            'SELECT * FROM agent_app WHERE agent_id = ? ORDER BY app_id ASC',
+            (agent_id,),
+        ).fetchall()
+        return rows_to_dict_list(rows)
+
+    def list_by_app(self, app_id: str) -> list[dict]:
+        rows = get_conn().execute(
+            'SELECT * FROM agent_app WHERE app_id = ? AND enabled = 1',
+            (app_id,),
+        ).fetchall()
+        return rows_to_dict_list(rows)
+
+    def get(self, agent_id: str, app_id: str) -> dict | None:
+        row = get_conn().execute(
+            'SELECT * FROM agent_app WHERE agent_id = ? AND app_id = ?',
+            (agent_id, app_id),
+        ).fetchone()
+        return row_to_dict(row)
+
+    def upsert(self, agent_id: str, app_id: str, enabled: bool = True,
+               config_json: str = "{}") -> dict:
+        row = self.get(agent_id, app_id)
+        ts = now_ts()
+        with transaction():
+            if row:
+                get_conn().execute(
+                    "UPDATE agent_app SET enabled = ?, config_json = ?, updated_at = ? WHERE agent_id = ? AND app_id = ?",
+                    (1 if enabled else 0, config_json, ts, agent_id, app_id),
+                )
+            else:
+                get_conn().execute(
+                    "INSERT INTO agent_app (agent_id, app_id, enabled, config_json, installed_at, updated_at) VALUES (?,?,?,?,?,?)",
+                    (agent_id, app_id, 1 if enabled else 0, config_json, ts, ts),
+                )
+        return self.get(agent_id, app_id) or {}
+
+    def toggle(self, agent_id: str, app_id: str, enabled: bool) -> bool:
+        row = self.get(agent_id, app_id)
+        ts = now_ts()
+        with transaction():
+            if row:
+                get_conn().execute(
+                    "UPDATE agent_app SET enabled = ?, updated_at = ? WHERE agent_id = ? AND app_id = ?",
+                    (1 if enabled else 0, ts, agent_id, app_id),
+                )
+            else:
+                get_conn().execute(
+                    "INSERT INTO agent_app (agent_id, app_id, enabled, config_json, installed_at, updated_at) VALUES (?,?,?,?,?,?)",
+                    (agent_id, app_id, 1 if enabled else 0, "{}", ts, ts),
+                )
+        return True
+
+    def delete(self, agent_id: str, app_id: str) -> bool:
+        with transaction():
+            cur = get_conn().execute(
+                "DELETE FROM agent_app WHERE agent_id = ? AND app_id = ?",
+                (agent_id, app_id),
+            )
+            return cur.rowcount > 0
+
+
+# ====== 跨应用共享凭据 ======
+class AppCredentialDAO:
+    """跨应用共享的凭据（好单库 API Key 等），value 存 DPAPI 加密后字符串"""
+
+    def get(self, key: str) -> dict | None:
+        row = get_conn().execute(
+            'SELECT * FROM app_credential WHERE credential_key = ?', (key,)
+        ).fetchone()
+        return row_to_dict(row)
+
+    def list_all(self) -> list[dict]:
+        rows = get_conn().execute(
+            'SELECT * FROM app_credential ORDER BY credential_key ASC'
+        ).fetchall()
+        return rows_to_dict_list(rows)
+
+    def save(self, key: str, value: str) -> dict:
+        ts = now_ts()
+        with transaction():
+            existing = self.get(key)
+            if existing:
+                get_conn().execute(
+                    "UPDATE app_credential SET value = ?, updated_at = ? WHERE credential_key = ?",
+                    (value, ts, key),
+                )
+            else:
+                get_conn().execute(
+                    "INSERT INTO app_credential (credential_key, value, updated_at) VALUES (?,?,?)",
+                    (key, value, ts),
+                )
+        return self.get(key) or {"credential_key": key, "value": value}
+
+    def delete(self, key: str) -> bool:
+        with transaction():
+            cur = get_conn().execute(
+                "DELETE FROM app_credential WHERE credential_key = ?", (key,)
+            )
+            return cur.rowcount > 0
