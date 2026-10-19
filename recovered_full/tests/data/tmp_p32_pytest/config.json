@@ -1,0 +1,8 @@
+{
+  "llm_api_key": "test-key",
+  "llm_provider": "kimi",
+  "llm_model": "auto",
+  "llm_base_url": "https://test.mock/v1",
+  "kb_wiki_root": "C:/Users/Administrator/Desktop/WeChatAI_Project/tests/data/tmp_p32_pytest/wiki",
+  "oa_cloud_base_url": ""
+}

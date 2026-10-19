@@ -1,0 +1,78 @@
+{
+  "llm_api_key": "MOCK_P34",
+  "llm_provider": "mock",
+  "llm_model": "auto",
+  "llm_base_url": "https://test.mock/v1",
+  "kb_wiki_root": "C:/Users/Administrator/Desktop/WeChatAI_Project/tests/data/tmp_p34_proto/wiki",
+  "oa_cloud_base_url": "",
+  "master_wxid": "wxid_master_p34",
+  "llm": {
+    "active_provider": "deepseek",
+    "providers": {
+      "deepseek": {
+        "api_base": "https://api.deepseek.com/v1",
+        "api_key": "",
+        "model": "deepseek-v4-flash",
+        "supports_image": false,
+        "supports_audio": false
+      },
+      "doubao": {
+        "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+        "api_key": "",
+        "model": "doubao-seed-2-0-lite",
+        "supports_image": true,
+        "supports_audio": true
+      }
+    },
+    "temperature": 0.7,
+    "max_tokens": 4096,
+    "timeout": 30,
+    "retry_count": 3,
+    "retry_delay": 2
+  },
+  "wcf": {
+    "ip": "localhost",
+    "port": 10086,
+    "api_key": "dada-wcf-2026-secret",
+    "auto_connect": false
+  },
+  "security": {
+    "api_key_encrypted": true,
+    "aigc_marker_enabled": true,
+    "aigc_explicit_label_enabled": false,
+    "aigc_prefix": "[AI]",
+    "safety_shell_enabled": true,
+    "compliance_shield_enabled": true
+  },
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "input_log_enabled": false,
+    "input_log_retention_days": 30,
+    "audit_log_enabled": false
+  },
+  "knowledge_base": {
+    "enabled": true,
+    "default_kb_name": "default",
+    "chunk_size": 512,
+    "chunk_overlap": 64,
+    "top_k": 3
+  },
+  "app": {
+    "theme": "light",
+    "language": "zh-CN",
+    "auto_connect": false,
+    "minimize_to_tray": true,
+    "auto_start": false,
+    "example_data_injected": true
+  },
+  "persona": {
+    "name": "鲜果小助手",
+    "type": "水果商家数字分身",
+    "description": "帮助水果商家在微信公众号自动回复客户咨询，涵盖品种介绍、价格、配送、售后等场景。",
+    "tone": "热情、专业、耐心，像邻居家的水果达人",
+    "background_story": "你是一家精品水果店的数字分身，店主经营水果 10 年，熟悉各类水果的产地、口感、季节性和挑选技巧。",
+    "language_style": "口语化，多用 emoji 🍎🍇🍊，避免生硬术语",
+    "keywords": "只回答水果相关问题，非水果话题礼貌引导回水果。价格以实际门店为准，不编造具体数字。"
+  }
+}

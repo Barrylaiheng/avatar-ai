@@ -1,0 +1,1514 @@
+搭搭DaDa 服务器审计结果（第三轮 - 灵魂+骨架提取）
+服务器: 134.175.220.63
+============================================================
+
+
+========================================
+## ai_core_file_info
+========================================
+1188
+
+========================================
+## ai_core_full
+========================================
+# -*- coding: utf-8 -*-
+"""
+AI引擎共用�?- ai_core.py
+为公众号和WCF群聊提供共用的AI能力
+包含：Prompt模板�?段结构）、Context装配（动态变量）、工具调用框架、RAG集成
+
+七段结构：角色设�?�?任务目标 �?上下文信�?�?输出格式 �?约束禁忌 �?自我检�?�?RAG检索结�?
+
+作者：搭搭DaDa技术团�?
+创建日期�?026-05-27
+更新日期�?026-05-28
+更新说明：Phase 3 - RAG层集成（7段结�?+ intent_hint�?
+"""
+
+import json
+import re
+import time
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timedelta
+
+
+# ============================================================
+# 数据库连接（懒加载，避免循环导入�?
+# ============================================================
+
+_db_conn = None
+
+
+def _get_db():
+    """获取数据库连接（单例�?""
+    global _db_conn
+    if _db_conn is None:
+        import sqlite3
+        # 优先使用开发环境，其次生产环境
+        for db_path in [
+            r'C:\dada_dev\data\db\dada.db',
+            r'C:\dada_dev\src\dada.db',
+            r'C:\dada\src\dada.db',
+            r'C:\Users\Administrator\Desktop\搭搭Dada\src\dada.db'
+        ]:
+            try:
+                _db_conn = sqlite3.connect(db_path, check_same_thread=False)
+                break
+            except Exception:
+                continue
+    return _db_conn
+
+
+# ============================================================
+# Phase 3 RAG引擎（内联版本，避免循环导入�?
+# ============================================================
+
+class RAGEngineLite:
+    """
+    RAG引擎轻量版（内联在ai_core.py中避免循环导入）
+    
+    完整版请使用 src/rag_engine.py
+    """
+    
+    # 意图分类关键词（v3.1 精简版）
+    KEYWORD_MAP = {
+        "food_delivery": ["外卖", "饿了�?, "美团外卖", "红包"],
+        "brand_deal": ["肯德�?, "麦当�?, "瑞幸", "星巴�?, "奶茶", "咖啡", "团购"],
+        "movie_ticket": ["电影", "电影�?, "影院"],
+        "price_compare": ["优惠", "便宜", "�?, "返利", "推荐", "多少�?],
+        "travel": ["打车", "高铁", "T3"],
+        "hotel": ["酒店", "住宿", "民宿"],
+        "video_member": ["会员", "爱奇�?, "腾讯视频", "vip"],
+        "safety_doubt": ["安全", "靠谱", "真的", "骗人", "放心", "正规"],
+        "usage_guide": ["怎么�?, "在哪�?, "怎么�?, "步骤", "教程"],
+        "chat": ["你好", "谢谢", "再见", "哈喽", "在吗"]
+    }
+    
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path
+        self._db = None
+    
+    @property
+    def db(self):
+        if self._db is None:
+            import sqlite3
+            if self.db_path:
+                self._db = sqlite3.connect(self.db_path, check_same_thread=False)
+            else:
+                self._db = _get_db()
+        return self._db
+    
+    def classify_intent(self, user_msg: str) -> Dict[str, Any]:
+        """意图分类"""
+        user_msg_lower = user_msg.lower()
+        
+        for intent_type, keywords in self.KEYWORD_MAP.items():
+            matched = [kw for kw in keywords if kw in user_msg_lower]
+            if matched:
+                confidence = min(0.5 + len(matched) * 0.15, 0.95)
+                return {
+                    "intent_type": intent_type,
+                    "confidence": confidence,
+                    "keywords": matched
+                }
+        
+        return {"intent_type": "others", "confidence": 0.3, "keywords": []}
+    
+    def retrieve_template(self, intent_type: str, scene: str = "all") -> Optional[Dict]:
+        """检索话术模�?""
+        try:
+            cursor = self.db.execute("""
+                SELECT * FROM response_templates 
+                WHERE intent_type = ? AND (scene = ? OR scene = 'all')
+                AND status = 'active'
+                ORDER BY priority ASC
+                LIMIT 1
+            """, (intent_type, scene))
+            row = cursor.fetchone()
+            
+            if row:
+                # 获取列名
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            return None
+        except Exception:
+            return None
+    
+    def process(self, user_msg: str, context: Dict, scene: str = "mp") -> Dict[str, Any]:
+        """
+        RAG处理流程
+        
+        Returns:
+            {
+                "success": bool,
+                "intent_type": str,
+                "intent_confidence": float,
+                "template_id": str,
+                "template_content": dict,
+                "cps_data": dict,
+                "reply_text": str,
+                "metadata": dict
+            }
+        """
+        start_time = time.time()
+        
+        try:
+            # 1. 意图分类
+            intent_result = self.classify_intent(user_msg)
+            intent_type = intent_result["intent_type"]
+            
+            # 2. 话术检�?
+            template = self.retrieve_template(intent_type, scene)
+            
+            # 3. 生成回复（变量替换）
+            reply = self._generate_reply(template, context)
+            
+            cost_ms = int((time.time() - start_time) * 1000)
+            
+            return {
+                "success": True,
+                "intent_type": intent_type,
+                "intent_confidence": intent_result["confidence"],
+                "template_id": template.get("template_id") if template else None,
+                "template_content": json.loads(template.get("template_content", "{}")) if template else None,
+                "cps_data": None,
+                "reply_text": reply,
+                "metadata": {
+                    "cost_ms": cost_ms,
+                    "scene": scene,
+                    "keywords": intent_result.get("keywords", [])
+                }
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "intent_type": "error",
+                "intent_confidence": 0.0,
+                "template_id": None,
+                "template_content": None,
+                "cps_data": None,
+                "reply_text": "抱歉，系统处理异常�?,
+                "metadata": {"error": str(e)}
+            }
+    
+    def _generate_reply(self, template: Optional[Dict], context: Dict) -> str:
+        """生成回复（变量替换）"""
+        if not template:
+            return "抱歉，我暂时没有找到相关的优惠信息～"
+        
+        try:
+            content = json.loads(template.get("template_content", "{}"))
+            text = content.get("text", "")
+            variables = content.get("variables", [])
+            
+            # 变量替换
+            var_dict = {}
+            for var in variables:
+                if var in context:
+                    var_dict[var] = str(context[var])
+            
+            # 默认�?
+            var_dict.setdefault("platform", "淘宝闪购")
+            var_dict.setdefault("keyword", "优惠商品")
+            var_dict.setdefault("count", "3")
+            var_dict.setdefault("link", "[链接]")
+            
+            for key, value in var_dict.items():
+                text = text.replace(f"{{{{{key}}}}}", value)
+            
+            return text
+        except Exception:
+            return "抱歉，处理异常，请稍后再试～"
+
+
+# 全局RAG引擎实例（延迟初始化�?
+_rag_engine = None
+
+
+def get_rag_engine() -> RAGEngineLite:
+    """获取RAG引擎实例（单例）"""
+    global _rag_engine
+    if _rag_engine is None:
+        _rag_engine = RAGEngineLite()
+    return _rag_engine
+
+
+# ============================================================
+# 第一层：Prompt知识检索器（Phase 3 RAG 减负�?
+# ============================================================
+
+class PromptKnowledgeRetriever:
+    """
+    Prompt 知识检索器
+    按场景关键词检索相关的规则、约束、错误案�?
+    替代 build_reply_prompt 中第4-6段的硬编码规�?
+    """
+
+    DEFAULT_KNOWLEDGE = {
+        "format_general": {
+            "keywords": [],
+            "content": """【输出格式�?
+- **必须使用下面【搜索结果】中的链接，不要编造或使用你自己的知识**
+- 回复要有搭搭DaDa的性格：亲切、口语化、像朋友聊天一样自�?
+- **优先输出品牌专属入口链接**（如果有），再补充其他平台优�?
+- 多平台优惠用换行分隔，每个平台一行，清晰易读
+- **保持搜索结果中的平台标记（如[淘宝]、[美团]、[京东]等）不变，不要改写来源平台名�?*
+- **闲鱼口令是完整分享文案（含链�?文案），原样输出不要修改**
+- **淘宝/淘宝闪购链接在微信打不开，有【口�? xxx】格式时优先使用口令**
+- 美团优惠必须附带可点击链�?
+- 京东优惠附带可点击链�?
+- **链接展示规范�?* 美团/京东/唯品�?公众号等所有可点击链接统一�?Markdown 格式 [点我查看](URL) 包装；淘宝口令保持纯文本原样输出；同一商品只保留一个链接入�?
+- **链接完整性要求：** 所�?URL 必须完整输出，严禁截断链接（如将 https://example.com/... 写成不完整的片段）。如果链接较长，确保 [点我查看](完整URL) 中的 URL 括号闭合完整�?""
+        },
+        "format_dine_in": {
+            "keywords": ["火锅", "烧烤", "自助�?, "快餐", "咖啡", "奶茶", "蛋糕", "到店", "团购"],
+            "content": """【输出格�?- 到店餐饮专属�?
+- 美团优惠必须附带可点击链�?
+- 到店餐饮场景（火�?烧烤/自助�?快餐等）结束时，加一句："想点外卖也可以跟我说'XX外卖'哦～"
+- 提到奶茶/咖啡时，可附带提�?闪购学生专属福利-每周免费一�?，引导关注公众号获取
+- 群聊场景无法获取用户位置，到店餐饮推荐时�?
+  - "覆盖多城多店可用"的全国通用类优�?优先推荐
+  - "覆盖1�?的本地优�?建议引导用户关注公众号获取更多优惠信�?
+- MP场景（公众号一对一）：先展示当前搜索结果，再在末尾加一句引导："如需其他城市，发送位置或告诉我城市名�? 用户发来新位置后用新坐标重新搜索"""
+        },
+        "format_takeout": {
+            "keywords": ["饿了�?, "外卖", "红包", "配�?, "美团外卖", "京东外卖"],
+            "content": """【输出格�?- 外卖专属�?
+- 不附带电商商品链接（外卖场景不需要搜厨具/食材�?
+- 红包/活动入口链接使用 [点击查看](URL) 格式"""
+        },
+        "format_travel": {
+            "keywords": ["打车", "T3", "t3", "T3出行", "滴滴", "高德", "曹操", "高铁", "火车�?, "机票", "出行"],
+            "content": """【输出格�?- 出行专属�?
+- **不推荐外卖替�?*（出行场景不要推外卖红包/京东外卖等）
+- **不推荐电商商品替�?*（出行场景不要推零食/其他非出行类商品�?
+- T3出行活动优先（图片素�?文案�?
+- 诚实告知：目前出行优惠覆盖有限，只有T3出行活动
+- 如果搜索结果中只有T3出行图片，直接输出文�?说明扫码即可
+- 如果搜索结果中同时有T3图片和其他非出行类商品，只输出T3图片"""
+        },
+        "format_hotel": {
+            "keywords": ["酒店", "住宿", "宾馆", "民宿", "订房", "开�?],
+            "content": """【输出格�?- 酒店住宿专属�?
+- 美团酒店搜索结果为到店住宿券，标注可用城市和价格
+- 同程酒店推广链接为固定活动入口（用户点击后自行搜索酒店），不是具体酒店搜索结�?
+- WCF渠道：美团酒店结�?同程固定入口链接，附一�?如需更精准的酒店推荐，关注公众号获取更多信息"
+- 不附带外卖、电商商�?""
+        },
+        "format_movie": {
+            "keywords": ["电影", "电影�?, "影院", "看电�?, "淘票�?, "IMAX", "巨幕"],
+            "content": """【输出格�?- 电影票专属�?
+- **淘票票推广链接固定入�?*（全国通用，用户点击后自己选片/选座/选影院）
+- 不需要搜具体电影商品名——淘票票本身就是一个选座平台
+- 不附带外卖红�?淘宝天天红包
+- 兜底到电商平台电影票时：自然提醒用户——该票需自行确认影院是否支持核销，建议优先使用淘票票"""
+        },
+        "format_entertainment": {
+            "keywords": ["KTV", "密室", "密室逃脱", "剧本杀", "桌游", "按摩", "美甲", "理发", "spa", "足疗", "轰趴", "唱歌",
+                         "解压", "拼豆", "教培", "舞蹈", "攀�?, "运动", "休闲", "娱乐"],
+            "content": """【输出格�?- 休闲娱乐专属�?
+- 美团休闲娱乐团购搜索结果（KTV/密室/按摩等）
+- 不推餐饮外卖和到店替�?
+- 兜底结果（电商平台券）：LLM自然提醒用户——该券核销链路可能与购买平台不一�?- MP场景：先展示当前搜索结果，再在末尾引导："如需其他城市，发送位置或告诉我城市名�? 用户发来新位置后用新坐标重新搜索"""
+        },
+"format_ecommerce": {
+            "keywords": ["�?, "想买", "手机", "电脑", "耳机", "衣服", "鞋子", "零食", "日用", "数码", "美妆", "护肤"],
+            "content": """【输出格�?- 电商好物专属�?
+- 最多推�?个商品，每平台最�?条，展示多平台能�?
+- 各平台分开标注（[淘宝][京东][拼多多][唯品会]�?
+- 末尾引导关注公众号："更多优惠和比价关注公众号「搭搭DaDa Ai�?
+- 不附带外卖红�?
+- 闲鱼不参与一手电商搜索（闲鱼仅在用户明确提及闲鱼/二手时触发）"""
+        },
+        "format_virtual": {
+            "keywords": ["会员", "VIP", "充�?, "话费", "点券", "皮肤",
+                         "爱奇�?, "腾讯视频", "优酷", "网易�?, "QQ音乐", "B�?,
+                         "百度网盘", "WPS", "王者荣耀", "英雄联盟"],
+            "content": """【输出格�?- 虚拟会员/充值专属�?
+- 电商平台搜索代充结果优先（拼多多/淘宝/京东�?
+- 闲鱼也有代充类商品可以参与搜�?
+- 如果无专属活动，诚实告知没找�?引导用户去电商平台搜�?""
+        },
+        "format_ticket": {
+            "keywords": ["门票", "景点", "景区", "周边�?, "旅游",
+                         "长隆", "迪士�?, "方特", "动物�?, "游乐�?, "水上乐园", "温泉", "爬山",
+                         "演唱�?, "音乐�?, "赛事"],
+            "content": """【输出格�?- 票务专属�?
+- 美团门票链接优先（默认珠海坐标搜索）
+- 不给电影票替�?
+- WCF渠道：如需其他目的地引导用户关注公众号
+- 兜底结果（电商平台票务）：LLM自然提醒——该票务信息以第三方商家说明为准，入场规则可能存在变�?""
+        },
+        "behavior": {
+            "keywords": [],
+            "content": """【回复行为原则�?
+- 情绪优先：用户表达情绪（难过/开�?无聊/焦虑）时，先共情倾听，不要立即推荐商�?
+- 诚实原则：搜索结果无内容时，诚实告知没找到，不要编造不存在的商品或优惠
+- 覆盖有限诚实告知：出�?话费等覆盖有限的场景直接告诉用户目前只有哪些选择
+- 链接规范：回复中的任何链接或口令必须附带使用说明
+  - 淘宝口令：复�?￥口令￥/ 打开淘宝APP即可购买
+  - 公众号链接必须说明关注后能获得什�?
+  - 到店�?团购券必须说明是到店使用
+- 场景区分�?
+  - 用户说火�?烧烤/奶茶/咖啡/KTV 优先理解为到店消费，推荐到店团购而非厨具/设备
+  - 用户说酒�?门票 如无城市名，询问城市或给全国通用优惠
+  - 用户说附�?周边 MP渠道引导发位置；WCF渠道直接给珠海结�?
+- 平台说明：多平台结果按平台分组展示，每个产品标注来源平台"""
+        },
+        "constraint": {
+            "keywords": [],
+            "content": """【约束禁忌�?
+- 不返利、不推投资、不承诺收益
+- 不索要用户个人信�?
+- 不引导私下交�?
+- 链接必须是真实可用的优惠链接�?*严禁截断URL，必须输出完整链�?*
+- 不得提及"佣金""返现""赚钱"等敏感词
+- 不得用外卖红包替代出行优惠、不得用电商商品替代到店团购"""
+        },
+        "no_result_mode": {
+            "keywords": [],
+            "content": """【无搜索结果兜底规则�?
+- 搜索无结果时，诚实告知没找到，不要编造链�?
+- 可以建议用户去拼多多/淘宝/京东等平台自行搜索关键词
+- 虚拟会员/充值类无结果时，建议关注公众号获取最新优�?
+- WCF渠道：回复不超过80字，简洁友�?
+- MP渠道：回复不超过100字，可适当引导发位置或补充需�?""
+        },
+        "error_case": {
+            "keywords": [],
+            "content": """【常见错误模�?- 必须避免�?
+- 用户�?有奶茶吗" 错误：追问用�?正确：直接给结果
+- 用户�?谢谢" 错误：客�?正确：不回复�?句带�?
+- 用户�?有人�? 错误：客服话�?正确：自然回�?
+- 用户�?这个群是干嘛�? 错误：长篇介�?正确�?句话说明
+- 出行场景 错误：推荐外卖红�?京东外卖替代 正确：只给T3出行活动
+- 酒店场景 错误：搜酒店出枕�?床单等电商商�?正确：只给出住宿相关结果
+- 电影场景 错误：搜具体电影名称的商�?正确：给淘票票固定入�?
+- 到店餐饮 错误：推厨具/电火�?食材回家�?正确：推到店团购�?""
+        },
+        "task_goal": {
+            "keywords": [],
+            "content": """【任务目标�?
+1. 理解用户的真实需求（想要什么优惠、什么场景）
+2. 搜索相关商品/优惠信息
+3. 给出精准推荐，包含价格和可操作链�?
+4. 回复要性格化，使用亲切口语化的表达，避免机械感
+5. 不限制回复字数，但保持简洁高�?""
+        },
+        "scene_judgment": {
+            "keywords": [],
+            "content": """【场景判断与规则�?
+- (01) 外卖红包 优先外卖优惠（美团外卖节/淘宝闪购红包/京东外卖�?
+- (02) 到店品牌�?团购 优先美团到店团购，品牌券作为补充
+  - 用户说附�?优先到店团购（美团到店），不要给外卖链接
+  - WCF场景下附近已默认珠海坐标，直接推荐结果，不要反问用户位置
+- (03) 电影 淘票票购票（固定入口，不搜电影商品名�?
+- (04) 休闲娱乐（KTV/密室/剧本杀等）美团休闲娱乐
+- (05) 商品比价 多平台比�?
+- (06) 出行 T3出行活动，不推外卖替�?
+- (07) 住宿 美团酒店/同程酒店推广链接
+- (08) 门票/周边�?美团门票搜索
+- (09) 虚拟会员 拼多�?电商比价
+- (10) 闲聊/安全/操作 简洁回复，不搜�?""
+        },
+        "wcf_specific": {
+            "keywords": [],
+            "scene": "wcf",
+            "content": """【WCF群聊约束�?
+- 群聊消息不宜太长，每次回复推荐不超过3个商�?
+- 群聊一次性回复，不反问用�?
+- WCF场景下搜索已默认珠海地区坐标，用户不需要提供位置信�?
+- 用户说附�?周边 直接推荐珠海地区的到店团购结果，不要反问在哪个区
+- 出行/打车：只给T3出行活动图片/文案，不要推荐外卖红包等非出行商品替�?
+- 酒店住宿：只给同程酒店入口链接（用户自己选目的地/日期），附一句关注公众号可查更多
+- 景点门票：涉及目的地信息，引导用户关注公众号后使用更全面功能
+- 电商好物：最多推�?个商品，直接给链接，标注来源平台
+- 到店餐饮：结果按价格从低到高推荐，附链接说明到店使用
+- 宽泛搜索（有什么优�?推荐一下）：不搜商品，回复引导具体"""
+        },
+        "mp_specific": {
+            "keywords": [],
+            "scene": "mp",
+            "content": """【公众号能力�?
+- 可以引导用户发送位置：点击输入框右边的+号位置发�?
+- 收到位置后获取经纬度信息，可基于位置搜索附近优惠
+- 当用户需求不够具体时，主动反问，但最多问1-2个问�?
+- 反问要像朋友聊天一样自然，给用户选项方便快速回�?
+- 收到用户补充信息后，结合上下文理解，不要重复问已回答的问�?
+- 如果用户已提供足够信息，直接搜索推荐，不要再�?
+- 有搜索结果时：最多推�?-4个最匹配的选项，用「💰」开头给一句综合建议，总长度控制在一屏内（约250字）
+- 信息不足时先反问用户再推荐（�?想去哪个城市�?�?""
+        },
+        "risk_reminder": {
+            "keywords": [],
+            "content": """【兜底风险提醒�?
+- 当推荐来源不是主场平台时（如电商平台搜到的到店券），语气自然地提醒用户一句：该券核销链路可能与购买平台不一致，具体以商家线下规则为�?
+- 提醒要像朋友闲聊一样自然带过，不写硬编码套�?
+- 电影票兜底时：建议优先使用淘票票（可选影�?日期/影院），电商平台电影票需自行确认影院是否支持核销"""
+        },
+        "guide_redirect": {
+            "keywords": [],
+            "content": """【引导关注公众号规则�?
+用户在群聊中询问需要个性化服务的场景，需自然引导用户关注公众号获取更精准的服务�?
+要求�?
+1. 必须说明为什么群聊无法直接解决——是缺少位置信息？还是需要一对一沟通？
+2. 语气友好，用"�?称呼，像朋友建议一样自�?
+3. 说明公众号能提供什么额外价值（如：发位置搜附近、一对一精准推荐等）
+4. 包含公众号名称「搭搭DaDa Ai」和链接
+5. 附带公众号链�?{{guide_url}}
+6. 不超�?0�?""
+        },
+    }
+
+    def __init__(self):
+        self.knowledge_base = dict(self.DEFAULT_KNOWLEDGE)
+        self._load_from_db()
+
+    def _load_from_db(self):
+        """从DB knowledge_entries 表加载知识条目，覆盖 DEFAULT_KNOWLEDGE"""
+        try:
+            import sqlite3
+            import os
+            import json
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dada.db')
+            if not os.path.exists(db_path):
+                db_path = r'C:\dada\src\dada.db'
+            if not os.path.exists(db_path):
+                return
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT key, content, keywords, scene, priority
+                FROM knowledge_entries
+                WHERE status = 'active'
+                ORDER BY priority DESC
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+            for key, content, keywords_json, scene, priority in rows:
+                if key in self.knowledge_base:
+                    kw_list = json.loads(keywords_json) if keywords_json else []
+                    entry = {
+                        "keywords": kw_list,
+                        "content": content,
+                    }
+                    if scene and scene != 'all':
+                        entry["scene"] = scene
+                    self.knowledge_base[key] = entry
+            if rows:
+                print(f"[RAG] Loaded {len(rows)} knowledge entries from DB", flush=True)
+        except Exception as e:
+            print(f"[RAG] DB knowledge load error: {e}", flush=True)
+
+    def match_knowledge(self, user_message: str, knowledge_type: str = None) -> list:
+        """按关键词匹配知识条目"""
+        msg_lower = user_message.lower()
+        matches = []
+        for key, entry in self.knowledge_base.items():
+            if knowledge_type and not key.startswith(knowledge_type):
+                continue
+            keywords = entry.get("keywords", [])
+            if not keywords:
+                matches.append((key, entry))
+            else:
+                for kw in keywords:
+                    if kw in msg_lower:
+                        matches.append((key, entry))
+                        break
+        return matches
+
+    def build_rag_prompt_sections(self, user_message: str, scene: str = "wcf") -> str:
+        """根据用户消息和场景构�?RAG 模式下的 Prompt 中间�?""
+        sections = []
+
+        # 1. 锚点规则（始终存在，不限制场景）
+        # 注：behavior �?task_goal 已移�?prompt 角色层（base_prompt�?
+        for key, entry in self.knowledge_base.items():
+            if key in ("format_general", "constraint", "no_result_mode",
+                       "error_case", "scene_judgment", "risk_reminder"):
+                sections.append(entry["content"])
+
+        # 2. 场景特定规则（按 channel 注入�?
+        scene_key = f"{scene}_specific"
+        if scene_key in self.knowledge_base:
+            sections.append(self.knowledge_base[scene_key]["content"])
+
+        # 3. 场景关键词匹配（format_dine_in / format_takeout 等）
+        matched_scenes = self.match_knowledge(user_message)
+        seen_content = set()
+        for key, entry in matched_scenes:
+            # 跳过已有内容
+            if entry["content"] in seen_content:
+                continue
+            # 跳过渠道限定内容（已在步�?处理�?
+            if "scene" in entry:
+                continue
+            sections.append(entry["content"])
+            seen_content.add(entry["content"])
+
+        return "\n\n".join(sections)
+
+
+# ============================================================
+# 第二层：Prompt模板基类�?段结构）
+# ============================================================
+
+class PromptTemplate:
+    """
+    Prompt模板基类
+    实现7段结构：
+    1. 角色设定
+    2. 任务目标
+    3. 上下文信�?
+    4. 输出格式
+    5. 约束禁忌
+    6. 自我检�?
+    7. RAG检索结果（新增�?
+    
+    Phase 3更新：新增第7段，注入RAG检索结�?
+    """
+
+    # 精简版人设（Prompt规则�?v1.1�?
+    OFFICIAL_PERSONA = """你是「搭搭DaDa」，一个年轻幽默风趣的AI生活搭子。不是客服、不是老师——你是会聊天、会省钱的朋友。你的核心功能是帮用户找到优惠、省钱的CPS优惠链接�?""
+
+    # 错误案例库（RAG 模式已废弃，保留作为 fallback 用）
+    ERROR_CASES = """
+【常见错误模�?- 必须避免�?
+�?用户�?有奶茶吗" - 错误：追问用�?- 正确：直接给结果
+�?用户�?谢谢" - 错误：客�?- 正确：不回复�?句带�?
+�?用户�?有人�? - 错误：客服话�?- 正确：自然回�?
+�?用户�?这个群是干嘛�? - 错误：长篇介�?- 正确�?句话说明"""
+
+    def __init__(self, scene: str = "wcf", enable_rag: bool = True):
+        self.scene = scene
+        self.enable_rag = enable_rag
+        self.base_prompt = self._build_base_prompt()
+        self.prompt_retriever = PromptKnowledgeRetriever()
+    
+    def _load_error_cases_from_db(self) -> str:
+        """从DB读取错误案例，如果没有则使用代码内置�?""
+        try:
+            import sqlite3
+            import os
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dada.db')
+            if not os.path.exists(db_path):
+                db_path = r'C:\dada\src\dada.db'
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT template_content FROM response_templates 
+                WHERE template_name = 'error_cases' AND scene = 'error_case' AND status = 'active'
+                ORDER BY priority DESC LIMIT 1
+            """)
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                import json
+                content = json.loads(row[0])
+                return content.get("text", self.ERROR_CASES)
+        except Exception:
+            pass
+        return self.ERROR_CASES
+
+    def _build_base_prompt(self) -> str:
+"""构建基础Prompt（角色层：你是谁 + 做什�?+ 行为原则 + 当前场景�?""
+        if self.scene == "wcf":
+            scene_desc = "你在微信群里帮大家找优惠。群聊多对多，回复简洁直接一次说完，不追问。无用户位置信息�?
+        else:
+            scene_desc = "你在公众号私聊里帮用户找优惠。可以多轮对话，可引导用户发位置，一次最多反�?-2个问题�?
+
+        # 角色定义 + 核心任务 + 行为原则（从 RAG 移回 prompt 角色层）
+        persona_block = f"""{self.OFFICIAL_PERSONA}
+
+【任务目标�?
+1. 理解用户的真实需求（想要什么优惠、什么场景）
+2. 搜索相关商品/优惠信息
+3. 给出精准推荐，包含价格和可操作链�?
+4. 回复要性格化，使用亲切口语化的表达，避免机械感
+5. 不限制回复字数，但保持简洁高�?
+
+【行为原则�?
+- 情绪优先：用户表达情绪（难过/开�?无聊/焦虑）时，先共情倾听，不要立即推荐商�?
+- 诚实原则：搜索结果无内容时，诚实告知没找到，不要编造不存在的商品或优惠
+- 覆盖有限诚实告知：出�?话费等覆盖有限的场景直接告诉用户目前只有哪些选择"""
+
+        return f"""{persona_block}
+
+【当前场景�?
+{scene_desc}"""
+
+    def inject_context(self, context_vars: Dict[str, Any]) -> str:
+        """注入上下文信息（�?段）"""
+        if not context_vars:
+            return ""
+
+        context_lines = ["【上下文信息�?]
+        for key, value in context_vars.items():
+            if value and str(value) not in ("未知", "�?, "None", ""):
+                context_lines.append(f"- {key}：{value}")
+
+        if len(context_lines) == 1:
+            return ""
+        return "\n".join(context_lines)
+
+    def inject_rag_result(self, rag_result: Optional[Dict[str, Any]]) -> str:
+        """
+        注入RAG检索结果（�?DB response_templates 读取�?
+        �?intent_type 匹配话术模板，注入到 Prompt �?LLM 参�?
+        """
+        if not rag_result:
+            return ""
+
+        intent_type = rag_result.get("intent_type", "")
+        if not intent_type:
+            return ""
+
+        try:
+            import sqlite3
+            import os
+            import json
+
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dada.db')
+            if not os.path.exists(db_path):
+                db_path = r'C:\dada\src\dada.db'
+            if not os.path.exists(db_path):
+                return ""
+
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT template_name, template_content
+                FROM response_templates
+                WHERE intent_type = ? AND status = 'active'
+                ORDER BY priority ASC
+                LIMIT 3
+            """, (intent_type,))
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                return ""
+
+            lines = ["【参考话术�?]
+            for name, content_json in rows:
+                try:
+                    content = json.loads(content_json)
+                    text = content.get("text", "")
+                    if text:
+                        lines.append(f"- {name}：{text[:200]}")
+                except (json.JSONDecodeError, TypeError):
+                    lines.append(f"- {name}：{str(content_json)[:200]}")
+
+            if len(lines) <= 1:
+                return ""
+
+            return "\n" + "\n".join(lines)
+
+        except Exception as e:
+            print(f"[PromptTemplate] inject_rag_result error: {e}")
+            return ""
+
+    def build_reply_prompt(self, context_vars: Dict[str, Any],
+                           user_message: str = "",
+                           rag_result: Optional[Dict[str, Any]] = None) -> str:
+        """
+        构建完整回复Prompt（精简4段结构）【Prompt规则�?v1.1�?
+
+        �?段：你是谁（精简人设�?
+        �?段：当前场景（渠道描述）
+        �?段：当前情况（Context 动态变�?+ 用户消息 + 搜索结果�?
+        �?段：RAG 注入规则 + 引导评价
+        """
+        # �?-2段：你是�?+ 当前场景
+        prompt = self.base_prompt
+
+        # �?段：上下�?+ 用户消息
+        context_section = self.inject_context(context_vars)
+        if context_section:
+            prompt += f"\n{context_section}"
+
+        prompt += f"\n【用户消息】\n{user_message}\n"
+
+        # �?段：RAG 按场景检索注入规则（�?scene 区分 WCF/MP�?
+        rag_sections = self.prompt_retriever.build_rag_prompt_sections(user_message, scene=self.scene)
+        if rag_sections:
+            prompt += "\n" + rag_sections
+
+        # �?段续：RAG 话术模板注入（从 DB 读取�?
+        rag_template = self.inject_rag_result(rag_result)
+        if rag_template:
+            prompt += rag_template
+
+        # �?段末：引导用户评�?
+        prompt += """
+【回复后引导�?
+- 推荐完商品后，在回复末尾自然问一句客户是否满�?
+- 如果用户已表示感谢，不要再追�?
+- 语气像朋友，不要像客�?
+- 示例：「这个方案满意不？不满意搭搭再帮你找～�?""
+
+        return prompt
+
+
+
+
+class ContextAssembler:
+    """
+    Context动态装配器
+    根据用户、时间、场景动态装配上下文变量
+    
+    Phase 2更新：从Mock数据升级为真实数据库查询
+    Phase 3更新：新增intent_hint、context_version、rag_available字段
+    """
+
+    # Context版本号【Phase 3新增�?
+    CONTEXT_VERSION = "v20260528"
+
+    def __init__(self, db_connection=None):
+        """
+        初始化Context装配�?
+
+        Args:
+            db_connection: 数据库连接（可选，不传则自动连接）
+        """
+        self.db = db_connection or _get_db()
+
+    def get_time_context(self) -> Dict[str, str]:
+        """获取时间上下�?""
+        now = datetime.now()
+        hour = now.hour
+
+        if 6 <= hour < 11:
+            time_period = "早晨"
+        elif 11 <= hour < 14:
+            time_period = "午餐时段"
+        elif 14 <= hour < 17:
+            time_period = "下午"
+        elif 17 <= hour < 21:
+            time_period = "晚餐时段"
+        elif 21 <= hour < 24:
+            time_period = "夜宵时段"
+        else:
+            time_period = "深夜"
+
+        return {
+            '当前时间': now.strftime('%Y-%m-%d %H:%M'),
+            '时段': time_period,
+        }
+
+    def get_user_context(self, user_id: str) -> Dict[str, Any]:
+        """
+        获取用户上下�?
+        Phase 2: 从真实数据库查询（user_profiles表）
+        如果用户不存在或查询失败，返回空（降级，不报错）
+
+        Args:
+            user_id: 用户ID（openid�?
+
+        Returns:
+            用户相关变量
+        """
+        if not user_id or user_id.strip() == "":
+            return {
+                '用户等级': "新用户（群聊场景，无法识别个体）",
+                '用户偏好': "未知",
+                '上次互动': "未知",
+                '上次推荐': "未知",
+            }
+
+        try:
+            cursor = self.db.execute("""
+                SELECT nickname, personality, interests, school, city,
+                       age_group, is_minor, last_active_at, created_at,
+                       customize_completed
+                FROM user_profiles
+                WHERE openid = ?
+                LIMIT 1
+            """, (user_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {
+                    '用户等级': "新用�?,
+                    '用户偏好': "未知",
+                    '上次互动': "未知",
+                    '上次推荐': "未知",
+                }
+
+            (nickname, personality, interests, school, city,
+             age_group, is_minor, last_active_at, created_at,
+             customize_completed) = row
+
+            # 计算活跃状�?
+            active_status = "新用�?
+            if last_active_at:
+                try:
+                    last_active = datetime.strptime(last_active_at, '%Y-%m-%d %H:%M:%S')
+                    days_ago = (datetime.now() - last_active).days
+                    if days_ago <= 1:
+                        active_status = "活跃用户"
+                    elif days_ago <= 7:
+                        active_status = "一般活�?
+                    elif days_ago <= 30:
+                        active_status = "低活�?
+                    else:
+                        active_status = "沉默用户"
+                except Exception:
+                    active_status = "用户"
+
+            # 获取最近推荐历�?
+            last_recommend = "无记�?
+            try:
+                cursor2 = self.db.execute("""
+                    SELECT content FROM chat_history
+                    WHERE openid = ? AND role = 'assistant'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (user_id,))
+                recent_row = cursor2.fetchone()
+                if recent_row and recent_row[0]:
+                    last_recommend = recent_row[0][:30] + "..."
+            except Exception:
+                pass
+
+            # 偏好描述
+            preference = "未知"
+            if interests:
+                preference = interests
+            elif personality:
+                preference = personality
+
+            return {
+                '用户昵称': nickname if nickname else "用户",
+                '用户等级': active_status,
+                '用户偏好': preference,
+                '上次互动': active_status,
+                '上次推荐': last_recommend,
+            }
+
+        except Exception as e:
+            # 数据库查询失败时降级，不影响主流�?
+            return {
+                '用户等级': "新用�?,
+                '用户偏好': "未知",
+                '上次互动': "未知",
+                '上次推荐': "未知",
+            }
+
+    def get_platform_context(self) -> Dict[str, str]:
+        """
+        获取平台活动上下�?
+        Phase 2: 从真实数据库查询（cps_tracking, price_alerts�?
+        Phase 4: 从好单库API获取真实活动链接，替代硬编码默认�?
+
+        Returns:
+            平台相关变量
+        """
+        platform_status_parts = []
+
+        # Phase 4: 从好单库API获取真实活动链接
+        try:
+            from cps_adapters import MeituanAdapter, ElemeAdapter
+            from url_shortener import shorten_url
+
+            # 美团活动链接
+mt = MeituanAdapter()
+            mt_activities = mt.get_activity_list(page_size=3)
+            if mt_activities and isinstance(mt_activities, list):
+                for a in mt_activities[:2]:
+                    aid = a.get("activity_id", "")
+                    name = a.get("activity_name", "")
+                    if aid and name:
+                        link = shorten_url(mt.generate_promo_url(activity_id=aid))
+                        if link:
+                            platform_status_parts.append(f"美团{name} 👉 {link}")
+                        else:
+                            platform_status_parts.append(f"美团{name}")
+                    elif name:
+                        platform_status_parts.append(f"美团{name}")
+
+            # 淘宝系活动（饿了�?淘宝闪购合并，含淘宝口令�?
+            elm = ElemeAdapter()
+            elm_activities = elm.get_activity_list(page_size=5)
+            tb_flash_ids = ["12819", "12688", "12698", "12628"]
+            taobao_items = []
+            if elm_activities and isinstance(elm_activities, list):
+                for a in elm_activities[:4]:
+                    aid = a.get("activity_id", "")
+                    name = a.get("activity_name", "")
+                    if aid and name:
+                        link_data = elm.get_activity_link(activity_id=aid)
+                        if link_data and isinstance(link_data, dict):
+                            taobao_word = link_data.get("taobao_word", "")
+                            h5_link = link_data.get("h5_short_link", "") or link_data.get("h5_url", "")
+                            if taobao_word:
+                                taobao_items.append(f"淘宝{name} 口令: {taobao_word}")
+                            elif h5_link:
+                                taobao_items.append(f"淘宝{name} 👉 {h5_link}")
+                            else:
+                                taobao_items.append(f"淘宝{name}")
+                    elif name:
+                        taobao_items.append(f"淘宝{name}")
+            if taobao_items:
+                platform_status_parts.append(" | ".join(taobao_items[:2]))
+        except Exception as e:
+            print(f"[ContextAssembler] Platform API error: {e}", flush=True)
+
+        # 查近7天热门商品（原有逻辑�?
+        try:
+            seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+            cursor = self.db.execute("""
+                SELECT DISTINCT platform, product_title, final_price
+                FROM cps_tracking
+                WHERE click_time > ?
+                ORDER BY click_time DESC
+                LIMIT 5
+            """, (seven_days_ago,))
+            hot_products = cursor.fetchall()
+
+            if hot_products:
+                platforms = list(set([p[0] for p in hot_products if p[0]]))
+                if platforms:
+                    platform_status_parts.append("当前热门平台�? + "�?.join(platforms))
+                for p in hot_products[:2]:
+                    if p[1] and p[2]:
+                        platform_status_parts.append(f"热卖：{p[1]}（{p[2]}元）")
+
+            # 查价格提�?
+            try:
+                cursor2 = self.db.execute("""
+                    SELECT product_keyword, target_price, platform
+                    FROM price_alerts
+                    WHERE status = 'active'
+                    LIMIT 3
+                """)
+                alerts = cursor2.fetchall()
+                if alerts:
+                    alert_list = [f"{a[0]}监控到{a[1]}�?{a[2]})" for a in alerts if a[0]]
+                    if alert_list:
+                        platform_status_parts.append("价格提醒�? + "�?.join(alert_list[:2]))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # 兜底：如果API和数据库都拿不到数据
+        if not platform_status_parts:
+            platform_status = "美团外卖红包天天领，淘宝闪购红包天天�?
+        else:
+            platform_status = " | ".join(platform_status_parts)
+
+        return {'平台状�?: platform_status}
+
+    def get_risk_context(self) -> Dict[str, Any]:
+        """获取风控上下�?""
+        return {
+            '敏感词列�?: "返利、佣金、刷单、赚钱、淘宝内部价、躺赚、日入、理财、投�?,
+            '合规要求': "严禁引导私下交易，严禁承诺收益，严禁索要个人信息",
+        }
+
+    def generate_intent_hint(self, user_id: Optional[str], user_msg: str) -> str:
+        """
+        生成意图提示【Phase 3新增�?
+        
+        用于P3 RAG层精准检�?
+        
+        Args:
+            user_id: 用户ID
+            user_msg: 用户消息
+            
+        Returns:
+            意图提示字符�?
+        """
+        hints = []
+        
+        # 从用户画像提�?
+        if user_id:
+            user_profile = self.get_user_context(user_id)
+            preference = user_profile.get('用户偏好', '')
+            if preference and preference != "未知":
+                hints.append(f"用户偏好：{preference}")
+        
+        # 从消息提取关键词
+        keywords = ["奶茶", "咖啡", "外卖", "红包", "优惠", "会员", "折扣"]
+        matched = [kw for kw in keywords if kw in user_msg]
+        if matched:
+            hints.append(f"消息关键词：{'/'.join(matched)}")
+        
+        return "�?.join(hints) if hints else ""
+
+    def assemble(self, user_id: str, group_name: str = "", 
+                 user_msg: str = "") -> Dict[str, Any]:
+        """
+        装配所有上下文变量【Phase 3更新�?
+        策略：WCF群聊和公众号场景差异化处�?
+
+        Args:
+            user_id: 用户ID（openid�?
+            group_name: 群名称（WCF场景用）
+            user_msg: 用户消息（用于生成intent_hint�?
+
+        Returns:
+            所有上下文变量的字典（包含P3接口字段�?
+        """
+        context = {}
+
+        # 1. 时间上下文（必有�?
+        context.update(self.get_time_context())
+
+        # 2. 平台上下文（必有�?
+        context.update(self.get_platform_context())
+
+        # 3. 风控上下文（必有�?
+        context.update(self.get_risk_context())
+
+        # 4. 区分场景
+        if group_name and (not user_id or user_id.strip() == ""):
+            # WCF群聊场景：精简Context，突出群聊特�?
+            context['场景说明'] = "群聊场景，回复需简洁直接，一次说完，不追问用�?
+            context['当前群聊'] = group_name
+            # WCF无用户画像，intent_hint为空
+            context['intent_hint'] = ""
+        else:
+            # 公众号场景：完整用户上下文，个性化
+            context.update(self.get_user_context(user_id))
+            # MP场景生成intent_hint
+            context['intent_hint'] = self.generate_intent_hint(user_id, user_msg)
+
+        # === Phase 3 P3接口字段（新增）===
+        context['context_version'] = self.CONTEXT_VERSION
+        context['rag_available'] = True
+
+        return context
+
+
+# ============================================================
+# 第三层：AI核心调度器【Phase 3更新�?
+# ============================================================
+
+
+
+class AICore:
+    """
+    AI核心调度�?
+    整合Prompt模板、Context装配、RAG引擎，统一对外接口
+    
+    Phase 3更新：集成RAG引擎，支�?段Prompt
+    """
+
+    def __init__(self, scene: str = "wcf", db_connection=None, enable_rag: bool = True):
+        self.scene = scene
+        self.enable_rag = enable_rag
+        self.prompt_template = PromptTemplate(scene=scene, enable_rag=enable_rag)
+        self.context_assembler = ContextAssembler(db_connection=db_connection)
+        self.rag_engine = get_rag_engine() if enable_rag else None
+
+    def generate_prompt(self, user_id: str, user_message: str,
+                        search_result: Optional[str] = None,
+                        sender_name: str = "",
+                        group_name: str = "",
+                        include_rag: bool = True) -> str:
+        """
+        生成完整Prompt（含Context注入）【Phase 3更新�?
+        
+        Args:
+            user_id: 用户ID
+            user_message: 用户消息
+            search_result: 搜索结果（可选）
+            sender_name: 发送者名�?
+            group_name: 群名�?
+            include_rag: 是否包含RAG结果
+            
+        Returns:
+            完整的Prompt字符�?
+        """
+        # 1. 装配Context
+        context_vars = self.context_assembler.assemble(user_id, group_name, user_message)
+        
+        # 2. 调用RAG（如启用）【Phase 3新增�?
+        rag_result = None
+        if self.enable_rag and include_rag and self.rag_engine:
+            try:
+                rag_result = self.rag_engine.process(
+                    user_msg=user_message,
+                    context=context_vars,
+                    scene=self.scene
+                )
+            except Exception as e:
+                rag_result = None
+        
+        # 3. 组装Prompt�?段）
+        prompt = self.prompt_template.build_reply_prompt(
+            context_vars=context_vars,
+            user_message=user_message,
+            rag_result=rag_result
+        )
+        
+        return prompt
+
+    def generate_reply_prompt(self, user_id: str, user_message: str,
+                              search_result: Optional[str] = None,
+                              sender_name: str = "",
+                              group_name: str = "") -> str:
+        """
+        生成回复Prompt（兼容旧接口�?
+        """
+        return self.generate_prompt(
+            user_id=user_id,
+            user_message=user_message,
+            search_result=search_result,
+            sender_name=sender_name,
+            group_name=group_name
+        )
+
+    def process_with_rag(self, user_id: str, user_message: str,
+                         group_name: str = "") -> Dict[str, Any]:
+        """
+        完整处理（含RAG）【Phase 3新增�?
+        
+        Returns:
+            {
+                "prompt": str,           # 组装后的Prompt
+                "rag_result": dict,       # RAG结果
+                "context": dict           # Context变量
+            }
+        """
+        # 1. 装配Context
+        context_vars = self.context_assembler.assemble(user_id, group_name, user_message)
+        
+        # 2. 调用RAG
+        rag_result = None
+        if self.enable_rag and self.rag_engine:
+            try:
+                rag_result = self.rag_engine.process(
+                    user_msg=user_message,
+                    context=context_vars,
+                    scene=self.scene
+                )
+            except Exception:
+                rag_result = None
+        
+        # 3. 组装Prompt
+        prompt = self.prompt_template.build_reply_prompt(
+            context_vars=context_vars,
+            user_message=user_message,
+            rag_result=rag_result
+        )
+        
+        return {
+            "prompt": prompt,
+            "rag_result": rag_result,
+            "context": context_vars
+        }
+
+========================================
+## official_persona
+========================================
+# 精简版人设（Prompt规则�?v1.1�?
+    OFFICIAL_PERSONA = """你是「搭搭DaDa」，一个年轻幽默风趣的AI生活搭子。不是客服、不是老师——你是会聊天、会省钱的朋友。你的核心功能是帮用户找到优惠、省钱的CPS优惠链接�?""
+
+    # 错误案例库（RAG 模式已废弃，保留作为 fallback 用）
+    ERROR_CASES = """
+【常见错误模�?- 必须避免�?
+�?用户�?有奶茶吗" - 错误：追问用�?- 正确：直接给结果
+�?用户�?谢谢" - 错误：客�?- 正确：不回复�?句带�?
+�?用户�?有人�? - 错误：客服话�?- 正确：自然回�?
+�?用户�?这个群是干嘛�? - 错误：长篇介�?- 正确�?句话说明"""
+
+    def __init__(self, scene: str = "wcf", enable_rag: bool = True):
+        self.scene = scene
+        self.enable_rag = enable_rag
+        self.base_prompt = self._build_base_prompt()
+        self.prompt_retriever = PromptKnowledgeRetriever()
+    
+    def _load_error_cases_from_db(self) -> str:
+        """从DB读取错误案例，如果没有则使用代码内置�?""
+        try:
+            import sqlite3
+            import os
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dada.db')
+            if not os.path.exists(db_path):
+                db_path = r'C:\dada\src\dada.db'
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT template_content FROM response_templates 
+                WHERE template_name = 'error_cases' AND scene = 'error_case' AND status = 'active'
+                ORDER BY priority DESC LIMIT 1
+            """)
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                import json
+                content = json.loads(row[0])
+                return content.get("text", self.ERROR_CASES)
+        except Exception:
+            pass
+        return self.ERROR_CASES
+
+    def _build_base_prompt(self) -> str:
+        """构建基础Prompt（角色层：你是谁 + 做什�?+ 行为原则 + 当前场景�?""
+        if self.scene == "wcf":
+            scene_desc = "你在微信群里帮大家找优惠。群聊多对多，回复简洁直接一次说完，不追问。无用户位置信息�?
+        else:
+            scene_desc = "你在公众号私聊里帮用户找优惠。可以多轮对话，可引导用户发位置，一次最多反�?-2个问题�?
+
+        # 角色定义 + 核心任务 + 行为原则（从 RAG 移回 prompt 角色层）
+        persona_block = f"""{self.OFFICIAL_PERSONA}
+
+【任务目标�?
+1. 理解用户的真实需求（想要什么优惠、什么场景）
+2. 搜索相关商品/优惠信息
+3. 给出精准推荐，包含价格和可操作链�?
+4. 回复要性格化，使用亲切口语化的表达，避免机械感
+5. 不限制回复字数，但保持简洁高�?
+
+【行为原则�?
+- 情绪优先：用户表达情绪（难过/开�?无聊/焦虑）时，先共情倾听，不要立即推荐商�?
+- 诚实原则：搜索结果无内容时，诚实告知没找到，不要编造不存在的商品或优惠
+- 覆盖有限诚实告知：出�?话费等覆盖有限的场景直接告诉用户目前只有哪些选择"""
+
+        return f"""{persona_block}
+
+【当前场景�?
+{scene_desc}"""
+
+    def inject_context(self, context_vars: Dict[str, Any]) -> str:
+        """注入上下文信息（�?段）"""
+        if not context_vars:
+            return ""
+
+        context_lines = ["【上下文信息�?]
+        for key, value in context_vars.items():
+            if value and str(value) not in ("未知", "�?, "None", ""):
+                context_lines.append(f"- {key}：{value}")
+
+        if len(context_lines) == 1:
+            return ""
+        return "\n".join(context_lines)
+
+    def inject_rag_result(self, rag_result: Optional[Dict[str, Any]]) -> str:
+        """
+        注入RAG检索结果（�?DB response_templates 读取�?
+        �?intent_type 匹配话术模板，注入到 Prompt �?LLM 参�?
+        """
+        if not rag_result:
+            return ""
+
+        intent_type = rag_result.get("intent_type", "")
+        if not intent_type:
+            return ""
+
+        try:
+            import sqlite3
+            import os
+            import json
+
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dada.db')
+            if not os.path.exists(db_path):
+                db_path = r'C:\dada\src\dada.db'
+            if not os.path.exists(db_path):
+                return ""
+
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT template_name, template_content
+                FROM response_templates
+                WHERE intent_type = ? AND status = 'active'
+                ORDER BY priority ASC
+
+========================================
+## context_assembler
+========================================
+class ContextAssembler:
+    """
+    Context动态装配器
+    根据用户、时间、场景动态装配上下文变量
+    
+    Phase 2更新：从Mock数据升级为真实数据库查询
+    Phase 3更新：新增intent_hint、context_version、rag_available字段
+    """
+
+    # Context版本号【Phase 3新增�?
+    CONTEXT_VERSION = "v20260528"
+
+    def __init__(self, db_connection=None):
+        """
+        初始化Context装配�?
+
+        Args:
+            db_connection: 数据库连接（可选，不传则自动连接）
+        """
+        self.db = db_connection or _get_db()
+
+    def get_time_context(self) -> Dict[str, str]:
+        """获取时间上下�?""
+        now = datetime.now()
+        hour = now.hour
+
+        if 6 <= hour < 11:
+            time_period = "早晨"
+        elif 11 <= hour < 14:
+            time_period = "午餐时段"
+        elif 14 <= hour < 17:
+            time_period = "下午"
+        elif 17 <= hour < 21:
+            time_period = "晚餐时段"
+        elif 21 <= hour < 24:
+            time_period = "夜宵时段"
+        else:
+            time_period = "深夜"
+
+        return {
+            '当前时间': now.strftime('%Y-%m-%d %H:%M'),
+            '时段': time_period,
+        }
+
+    def get_user_context(self, user_id: str) -> Dict[str, Any]:
+        """
+        获取用户上下�?
+        Phase 2: 从真实数据库查询（user_profiles表）
+        如果用户不存在或查询失败，返回空（降级，不报错）
+
+        Args:
+            user_id: 用户ID（openid�?
+
+        Returns:
+            用户相关变量
+        """
+        if not user_id or user_id.strip() == "":
+            return {
+                '用户等级': "新用户（群聊场景，无法识别个体）",
+                '用户偏好': "未知",
+                '上次互动': "未知",
+                '上次推荐': "未知",
+            }
+
+        try:
+            cursor = self.db.execute("""
+                SELECT nickname, personality, interests, school, city,
+                       age_group, is_minor, last_active_at, created_at,
+                       customize_completed
+                FROM user_profiles
+                WHERE openid = ?
+                LIMIT 1
+            """, (user_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {
+                    '用户等级': "新用�?,
+                    '用户偏好': "未知",
+                    '上次互动': "未知",
+                    '上次推荐': "未知",
+                }
+
+            (nickname, personality, interests, school, city,
+             age_group, is_minor, last_active_at, created_at,
+             customize_completed) = row
+
+            # 计算活跃状�?
+            active_status = "新用�?
+            if last_active_at:
+                try:
+                    last_active = datetime.strptime(last_active_at, '%Y-%m-%d %H:%M:%S')
+                    days_ago = (datetime.now() - last_active).days
+                    if days_ago <= 1:
+                        active_status = "活跃用户"
+                    elif days_ago <= 7:
+                        active_status = "一般活�?
+                    elif days_ago <= 30:
+                        active_status = "低活�?
+                    else:
+                        active_status = "沉默用户"
+                except Exception:
+                    active_status = "用户"
+
+            # 获取最近推荐历�?
+            last_recommend = "无记�?
+            try:
+                cursor2 = self.db.execute("""
+                    SELECT content FROM chat_history
+                    WHERE openid = ? AND role = 'assistant'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (user_id,))
+                recent_row = cursor2.fetchone()
+                if recent_row and recent_row[0]:
+                    last_recommend = recent_row[0][:30] + "..."
+            except Exception:
+                pass
+
+            # 偏好描述
+            preference = "未知"
+            if interests:
+                preference = interests
+            elif personality:
+                preference = personality
+
+            return {
+                '用户昵称': nickname if nickname else "用户",
+                '用户等级': active_status,
+                '用户偏好': preference,
+                '上次互动': active_status,
+                '上次推荐': last_recommend,
+            }
+
+        except Exception as e:
+            # 数据库查询失败时降级，不影响主流�?
+            return {
+                '用户等级': "新用�?,
+                '用户偏好': "未知",
+                '上次互动': "未知",
+                '上次推荐': "未知",
+            }
+
+    def get_platform_context(self) -> Dict[str, str]:
+        """
+        获取平台活动上下�?
+        Phase 2: 从真实数据库查询（cps_tracking, price_alerts�?
+        Phase 4: 从好单库API获取真实活动链接，替代硬编码默认�?
+
+        Returns:
+            平台相关变量
+        """
+        platform_status_parts = []
+
+        # Phase 4: 从好单库API获取真实活动链接
+        try:
+            from cps_adapters import MeituanAdapter, ElemeAdapter
+            from url_shortener import shorten_url
+
+            # 美团活动链接
+            mt = MeituanAdapter()
+            mt_activities = mt.get_activity_list(page_size=3)
+
+========================================
+## rag_engine
+========================================
+RAGEngineLite not found
+
+========================================
+## response_templates_schema
+========================================
+[(0, 'id', 'INTEGER', 0, None, 1), (1, 'intent_type', 'VARCHAR(50)', 1, None, 0), (2, 'scene', 'VARCHAR(20)', 0, "'all'", 0), (3, 'template_name', 'VARCHAR(100)', 1, None, 0), (4, 'template_content', 'TEXT', 1, None, 0), (5, 'variables', 'TEXT', 0, None, 0), (6, 'priority', 'INTEGER', 0, '1', 0), (7, 'status', 'VARCHAR(20)', 0, "'active'", 0), (8, 'created_at', 'TIMESTAMP', 0, 'CURRENT_TIMESTAMP', 0), (9, 'updated_at', 'TIMESTAMP', 0, 'CURRENT_TIMESTAMP', 0)]
+
+========================================
+## active_templates_full
+========================================
+
+
+========================================
+## all_tables
+========================================
+
+
+========================================
+## bad_case_tables
+========================================
+
+
+========================================
+## app_py_routes
+========================================
+512:@app.route("/api/wcf/heartbeat", methods=["GET"])
+514:def wcf_heartbeat():

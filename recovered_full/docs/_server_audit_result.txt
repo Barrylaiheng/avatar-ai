@@ -1,0 +1,311 @@
+搭搭DaDa 服务器审计结果
+服务器: 134.175.220.63
+============================================================
+
+
+## server_info
+
+
+## python_version
+Python 3.8.6
+
+## packages
+Flask                          2.0.3
+Flask-Session                  0.3.2
+Flask-SocketIO                 4.3.1
+Flask-SQLAlchemy               2.4.4
+paramiko                       2.7.1
+requests                       2.32.4
+waitress                       3.0.0
+
+## flask_routes
+  @app.route("/admin/login", methods=["GET", "POST"])
+  @app.route("/admin/logout")
+  @app.route("/api/wcf/receive", methods=["POST"])
+  @app.route("/api/wcf/reply", methods=["GET"])
+  @app.route("/api/wcf/heartbeat", methods=["GET"])
+  @app.route("/api/wcf/download_image", methods=["GET"])
+  @app.route("/api/wcf/check_image", methods=["POST"])
+  @app.route("/api/wcf/push", methods=["GET"])
+  @app.route("/health")
+  @app.route("/go/<short_id>")
+  @app.route("/admin/dashboard")
+  @app.route("/admin/feedback/list", methods=["GET"])
+  @app.route("/admin/feedback/stats", methods=["GET"])
+  @app.route("/admin/platform/stats", methods=["GET"])
+  @app.route("/admin/cps/stats", methods=["GET"])
+  @app.route("/api/wechat/jsconfig", methods=["GET"])
+
+## wechat_callback_lines
+
+
+## process_functions
+
+
+## server_py_files
+ab_test_phase2.py
+ab_test_prompt.py
+admin_engine.py
+admin_operations.py
+ai_core.py
+app.py
+asr_service.py
+bad_case_collector.py
+brand_config.py
+config.py
+content_moderation.py
+cps_adapters.py
+cps_core.py
+cps_service.py
+db.py
+deepseek_client.py
+deepseek_client_optimized.py
+deploy.py
+deploy_wcf_custom.py
+fc_engine.py
+fc_tools.py
+feishu_admin.py
+feishu_api.py
+feishu_config.py
+feishu_init.py
+feishu_sync.py
+geo_integration.py
+geo_service.py
+image_checker.py
+init_admin_templates.py
+init_bad_case_config.py
+init_channel_routing.py
+init_intent_keywords.py
+init_knowledge_entries.py
+init_rag_templates.py
+init_supply_station_db.py
+init_templates.py
+intent_resolver.py
+kf_message_handler.py
+main_kf.py
+mp_ai_engine.py
+mp_menu_config.py
+mp_routes.py
+phase3_verify.py
+phase4_verify.py
+pre_search.py
+push_menu.py
+questionnaire_templates.py
+rag_engine.py
+run_e2e_test.py
+run_v456_test.py
+scene_orchestrator.py
+scene_scheduler.py
+scheduler.py
+scoring_engine.py
+selection_service.py
+service_mp.py
+service_wcf.py
+signal_extractor.py
+supply_station.py
+test_asr.py
+test_asr2.py
+test_asr_direct.py
+test_asr_import.py
+test_async_flow.py
+test_bizline.py
+test_boundary.py
+test_fc_classification.py
+test_fc_direct.py
+test_fc_full.py
+test_generate_reply.py
+test_import.py
+test_import_server.py
+test_kf_push.py
+test_ktv_root.py
+test_menu_click.py
+test_mp_engine.py
+test_mp_scenes.py
+test_search_layer.py
+test_system.py
+test_system_v2.py
+test_tchotel.py
+test_tencent_asr.py
+test_wcf_search.py
+url_shortener.py
+v42_server_verify.py
+v44_post_check.py
+v44_quick_fix_verify.py
+v44_quick_verify.py
+v44_verify.py
+validate_online.py
+verify_asr.py
+verify_deploy.py
+verify_e2e_v2.py
+verify_fix.py
+verify_guardrails.py
+verify_import_deploy.py
+verify_keyword.py
+verify_post.py
+verify_post_deploy.py
+wcf_ai_engine.py
+wcf_push_scheduler.py
+wechat_kf_service.py
+wechat_push.py
+_check_tmp.py
+_clean_db.py
+_create_menu.py
+_deploy_check_post.py
+_fix_interactive.py
+_fix_menu.py
+_fix_minimal.py
+_fix_utf8.py
+_read_log.py
+_run_mp_test.py
+_test_import.py
+_verify.py
+
+## ai_core_structure
+53:class RAGEngineLite:
+227:class PromptKnowledgeRetriever:
+544:class PromptTemplate:
+743:class ContextAssembler:
+1078:class AICore:
+
+## db_tables
+
+
+## user_profiles_schema
+[(0, 'id', 'INTEGER', 0, None, 1), (1, 'openid', 'TEXT', 1, None, 0), (2, 'nickname', 'TEXT', 0, None, 0), (3, 'personality', 'TEXT', 0, "'��������'", 0), (4, 'interests', 'TEXT', 0, None, 0), (5, 'school', 'TEXT', 0, None, 0), (6, 'city', 'TEXT', 0, None, 0), (7, 'age_group', 'TEXT', 0, None, 0), (8, 'age_verified_at', 'TIMESTAMP', 0, None, 0), (9, 'is_minor', 'INTEGER', 0, '0', 0), (10, 'compliance_notified', 'TEXT', 0, "''", 0), (11, 'created_at', 'TIMESTAMP', 0, 'CURRENT_TIMESTAMP', 0), (12, 'updated_at', 'TIMESTAMP', 0, 'CURRENT_TIMESTAMP', 0), (13, 'last_active_at', 'TIMESTAMP', 0, None, 0), (14, 'customize_step', 'INTEGER', 0, '0', 0), (15, 'customize_completed', 'INTEGER', 0, '0', 0), (16, 'in_feedback_mode', 'INTEGER', 0, '0', 0)]
+
+## user_profiles_count
+109
+
+## chat_history_schema
+[(0, 'id', 'INTEGER', 0, None, 1), (1, 'openid', 'TEXT', 1, None, 0), (2, 'role', 'TEXT', 1, None, 0), (3, 'content', 'TEXT', 1, None, 0), (4, 'intent', 'TEXT', 0, None, 0), (5, 'created_at', 'TIMESTAMP', 0, 'CURRENT_TIMESTAMP', 0), (6, 'source', 'TEXT', 0, "'mp'", 0)]
+
+## chat_history_count
+130
+
+## active_templates
+[('�������-����', 'push_lunch'), ('�������-����ô', 'push_lunch'), ('�������-��������', 'push_lunch'), ('��������-����', 'push_dinner'), ('��������-����ô', 'push_dinner'), ('��ĩ����-�ۺ�', 'push_weekend'), ('�������-����', 'food_delivery'), ('�������-����ô', 'food_delivery'), ('�������-��������', 'food_delivery'), ('�����Ź�-���ŵ���', 'brand_deal'), ('Ʒ��ȯ-ͨ��', 'brand_deal'), ('��ӰƱ-��ƱƱ', 'movie_ticket'), ('��������-���ŵ���', 'movie_ticket'), ('��Ʒ�ȼ�-�������ں�', 'price_compare'), ('����-T3����', 'travel'), ('����-����Ʊ', 'travel'), ('ס��-�������ں�', 'hotel'), ('�����Ա-ͨ��', 'video_member'), ('����-���к�', 'chat'), ('����-Ⱥ˵��', 'chat')]
+
+## log_files
+image_error.log
+
+## recent_logs
+[2026-06-11 00:48:24] _wcf_process_image_and_reply called: msg_id=5665160699943076508, group=搭搭管理�? sender=Barry, base64_len=576344
+
+============================================================
+[2026-06-11 00:48:25] msg_id=5665160699943076508, group=搭搭管理�? sender=Barry
+Error: name 'CFG' is not defined
+Traceback (most recent call last):
+  File "app.py", line 1121, in _wcf_process_image_and_reply
+    is_supply_station = _wcf_is_supply_station_group(group_name, group_wxid)
+  File "app.py", line 828, in _wcf_is_supply_station_group
+    if not CFG.SUPPLY_STATION_ENABLED:
+NameError: name 'CFG' is not defined
+============================================================
+[2026-06-11 00:50:55] _wcf_process_image_and_reply called: msg_id=5390308448181611848, group=搭搭管理�? sender=Barry, base64_len=576344
+[2026-06-11 00:54:13] _wcf_process_image_and_reply called: msg_id=1117209983984213937, group=搭搭管理�? sender=Barry, base64_len=576344
+[2026-06-11 00:54:13] Step1 OK: decoded 432257 bytes
+[2026-06-11 00:54:13] Step2: OCR start...
+[2026-06-11 00:54:14] Step2 OK: success=False, result=[OCR识别失败: [TencentCloudSDKException] code:AuthFailure.UnauthorizedOperation message:操作未授权，请检查CAM策略。[
+[2026-06-11 00:54:14] Step3: save chat message...
+[2026-06-11 00:54:14] Step4: is_supply_station=True
+
+## env_config_redacted
+# ========== DadaDada 微信客服配置 ==========
+# 请根据企业微信后台获取的信息替换剩下的内容
+
+# 企业ID - 在"我的企业"页面最底部获取（已填）
+WECHAT_CORP_ID=ww575e824c7f513510
+
+# 自建应用 AgentId - 在自建应用详情页获取（已填）
+WECHAT_AGENT_ID=1000011
+
+# 自建应用 Secret - 在自建应用详情页点击查看获取（已填）
+WECHAT_SECRET=***REDACTED***
+
+# 回调验证 Token - 用户在后台重新生成
+WECHAT_CALLBACK_TOKEN=***REDACTED***
+
+# EncodingAESKey - 用户在后台重新生成（43位）
+WECHAT_ENCODING_AES_KEY=***REDACTED***
+
+# 客服账号 OpenKfId - 在微信客服→账号管理获取（已填）
+WECHAT_OPEN_KFID=DaZa@planbHongBeiJiHua
+
+# ========== 微信公众号配置 ==========
+# 从SECRETS.md获取
+WECHAT_TOKEN=***REDACTED***
+WECHAT_APPID=wxebd8c5932b1fbedf
+WECHAT_APPSECRET=***REDACTED***
+
+# ========== 腾讯云 ASR 语音识别 ==========
+# 腾讯云API密钥
+TENCENT_SECRET_ID=***REDACTED***
+TENCENT_SECRET_KEY=***REDACTED***
+
+# =***REDACTED***
+# 从SECRETS.md获取
+HDK_APIKEY=***REDACTED***
+
+# 淘宝推广位PID（从SECRETS.md获取）
+HDK_TB_PID=mm_7861328085_3406600334_116257950364
+
+# 唯品会推广位PID（从SECRETS.md获取）
+HDK_VIP_PID=054fd6b188f1ba06794fc610ef831e10
+
+# =***REDACTED***
+# 只使用 DeepSeek 官方 API，清理其他所有 LLM 密钥
+DEEPSEEK_API_KEY=***REDACTED***
+DEEPSEEK_API_URL=***REDACTED***
+DEEPSEEK_MODEL=deepseek-v4-flash
+USE_DEEPSEEK_MAIN=true
+
+# 腾讯云 DeepSeek 备用
+TENCENT_DEEPSEEK_API_KEY=***REDACTED***
+TENCENT_DEEPSEEK_API_URL=***REDACTED***
+
+# ========== 京东配置 ==========
+HDK_JD_ENABLED=true
+HDK_JD_USER_ID=
+
+# ========== 拼多多配置 ==========
+HDK_PDD_ENABLED=true
+HDK_PDD_PID=
+
+# =***REDACTED***
+HDK_MT_ENABLED=true          # 美团
+HDK_ELM_ENABLED=true         # 饿了么
+HDK_VIP_ENABLED=true         # 唯品会
+HDK_TPP_ENABLED=true         # 淘票票
+HDK_TCHOTEL_ENABLED=true     # 同程酒店
+HDK_LOCAL_LIFE_ENABLED=true  # 本地生活特权
+HDK_XIANYU_ENABLED=true      # 闲鱼
+HDK_TB_LIVE_ENABLED=true     # 淘宝直播
+
+# ========== 管理员配置 ==========
+# 管理员微信 openid（逗号分隔，用于 #日报 #反馈 等指令）
+ADMIN_OPENIDS=
+# Web 后台 IP 白名单（逗号分隔，为空则不限制）
+ADMIN_IPS=
+# Web 后台访问密码（为空则不需要密码）
+ADMIN_PASSWORD=***REDACTED***
+# 飞书 Webhook URL（用于通知推送，为空则不推送）
+FEISHU_WEBHOOK=
+# P0-5: 数据加密密钥（建议在.env中设置，不设置则使用默认密钥）
+DADA_ENCRYPT_KEY=***REDACTED***
+
+## waitress_port
+TCP    127.0.0.1:8501         0.0.0.0:0              LISTENING
+  TCP    127.0.0.1:8501         127.0.0.1:57689        ESTABLISHED
+  TCP    127.0.0.1:57689        127.0.0.1:8501         ESTABLISHED
+
+## apache_443
+TCP    0.0.0.0:443            0.0.0.0:0              LISTENING
+  TCP    [::]:443               [::]:0                 LISTENING
+
+## scheduled_task
+�ļ���: \
+������:       10_1_0_11
+������:       \DaDa
+�´�����ʱ��: N/A
+ģʽ:         ����
+��¼״̬:     ������ʽ/��̨��ʽ

@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>企微连接管理 · 基于 wecom-cli 实战验证</title>
+<style>
+  :root {
+    --bg-base: #0b1120;
+    --bg-secondary: #121826;
+    --bg-elevated: #1a2234;
+    --bg-glass: rgba(255,255,255,0.03);
+    --text-primary: #f1f5f9;
+    --text-muted: #64748b;
+    --text-dim: #475569;
+    --accent: #10b981;
+    --accent-soft: rgba(16,185,129,0.1);
+    --border: rgba(255,255,255,0.06);
+    --wecom-green: #2ba471;
+    --warn: #f59e0b;
+    --danger: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    padding: 32px;
+    min-height: 100vh;
+  }
+
+  .wrap { max-width: 780px; margin: 0 auto; }
+
+  /* ===== 侧边导航 ===== */
+  .sidebar {
+    width: 180px;
+    float: left;
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 12px;
+    display: flex; flex-direction: column; gap: 2px;
+    margin-right: 20px;
+  }
+  .sidebar-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px;
+    font-size: 13px; font-weight: 500;
+    color: var(--text-muted);
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .sidebar-item svg { width: 16px; height: 16px; }
+  .sidebar-item.active {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+  }
+
+  /* ===== 主内容区 ===== */
+  .main { margin-left: 200px; }
+  .page-title { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; }
+  .page-title b { color: var(--text-primary); font-size: 15px; font-weight: 600; }
+
+  /* 渠道标签页 */
+  .channel-tabs {
+    display: flex; gap: 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .channel-tab {
+    font-size: 13px; font-weight: 500;
+    padding: 10px 2px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color .15s;
+  }
+  .channel-tab:hover { color: var(--text-primary); }
+  .channel-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .channel-tab .coming-tag {
+    font-size: 10px;
+    padding: 1px 5px; border-radius: 3px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  /* 渠道卡片 */
+  .channel-card {
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 16px 20px;
+  }
+  .channel-card-head {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 14px;
+  }
+  .channel-icon {
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .channel-card-title {
+    font-size: 14px; font-weight: 600;
+  }
+  .channel-card-sub {
+    font-size: 12px; color: var(--text-muted);
+    margin-top: 1px;
+  }
+  .channel-status {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 13px;
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+  }
+  .channel-status.disconnected .status-dot { background: var(--danger); }
+  .channel-status.disconnected { color: var(--danger); }
+  .channel-status.connected .status-dot {
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+  }
+  .channel-status.connected { color: var(--accent); }
+
+  /* ===== 步骤行 —— 跟微信四步同构 ===== */
+  .step-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 0;
+    border-top: 1px solid var(--border);
+  }
+  .step-row:first-of-type { border-top: none; padding-top: 4px; }
+
+  .step-icon {
+    width: 18px; height: 18px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .step-row.done .step-icon { color: var(--accent); }
+
+  .step-text {
+    font-size: 13px; font-weight: 500;
+    color: var(--text-primary);
+    flex-shrink: 0;
+  }
+  .step-row.pending .step-text { color: var(--text-dim); }
+
+  .step-action { margin-left: auto; }
+
+  .step-status {
+    font-size: 11px; padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .step-status.ok { background: var(--accent-soft); color: var(--accent); }
+  .step-status.info { background: rgba(59,130,246,0.12); color: #3b82f6; }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 11px; font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: none; cursor: pointer;
+    height: 26px;
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    transition: all .15s;
+  }
+  .btn:hover { background: var(--bg-base); }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg-base);
+  }
+  .btn-primary:hover { filter: brightness(1.1); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  .step-row.pending { opacity: .4; pointer-events: none; transition: opacity .2s; }
+  .step-row.done + .step-row.pending,
+  .step-row.active + .step-row.pending { opacity: 1; pointer-events: auto; }
+
+  /* ===== 步骤 1 扫码区 ===== */
+  .qr-area {
+    display: none;
+    margin: 8px 0 4px;
+    padding: 14px;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: center;
+  }
+  .qr-area.show { display: block; }
+  .qr-box {
+    width: 160px; height: 160px;
+    background: white;
+    border-radius: 8px;
+    margin: 0 auto 10px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-dim);
+    font-size: 11px;
+  }
+  .qr-tip { font-size: 12px; color: var(--text-muted); line-height: 1.6; }
+  .qr-tip strong { color: var(--accent); }
+
+  /* ===== 步骤 3 测试消息区 ===== */
+  .test-msg-area {
+    display: none;
+    margin: 8px 0 4px;
+    padding: 12px 14px;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .test-msg-area.show { display: block; }
+  .test-msg-bubble {
+    background: var(--accent);
+    color: var(--bg-base);
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    display: inline-block;
+    max-width: 80%;
+  }
+  .test-msg-meta {
+    font-size: 11px; color: var(--text-muted);
+    margin-top: 6px;
+  }
+
+  /* ===== 步骤 4 轮询配置 ===== */
+  .poll-config {
+    display: none;
+    margin: 8px 0 4px;
+    padding: 12px 14px;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .poll-config.show { display: block; }
+  .poll-row {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 10px;
+  }
+  .poll-row:last-child { margin-bottom: 0; }
+  .poll-label { font-size: 12px; color: var(--text-muted); min-width: 72px; }
+  .poll-select {
+    flex: 1;
+    padding: 7px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  /* 开关 */
+  .switch {
+    position: relative;
+    width: 40px; height: 22px;
+    background: var(--bg-elevated);
+    border-radius: 11px;
+    cursor: pointer;
+    transition: background .2s;
+  }
+  .switch.on { background: var(--accent); }
+  .switch::after {
+    content: '';
+    position: absolute;
+    width: 18px; height: 18px;
+    background: white;
+    border-radius: 50%;
+    top: 2px; left: 2px;
+    transition: left .2s;
+  }
+  .switch.on::after { left: 20px; }
+
+  /* ===== 已连接运行面板 ===== */
+  .runtime-panel {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+  }
+  .runtime-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 0;
+    font-size: 12px;
+  }
+  .runtime-row .ok { color: var(--accent); }
+  .runtime-row .val {
+    color: var(--text-muted);
+    margin-left: auto;
+    font-family: "Cascadia Code", monospace;
+    font-size: 11px;
+  }
+
+  /* 优势说明卡 */
+  .advantage-card {
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: rgba(16,185,129,0.06);
+    border: 1px solid rgba(16,185,129,0.15);
+    border-radius: 8px;
+    font-size: 12px;
+    color: #34d399;
+    line-height: 1.7;
+  }
+  .advantage-card strong { color: var(--accent); }
+
+  /* 身份说明 */
+  .identity-note {
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: rgba(59,130,246,0.06);
+    border: 1px solid rgba(59,130,246,0.15);
+    border-radius: 8px;
+    font-size: 12px;
+    color: #60a5fa;
+    line-height: 1.7;
+  }
+  .identity-note strong { color: #3b82f6; }
+
+  /* 通信风控 */
+  .comm-stats {
+    margin-top: 14px;
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border-radius: 10px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .comm-stats .dot {
+    width: 30px; height: 30px;
+    background: rgba(16,185,129,0.1);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent);
+  }
+  .comm-stats .title { font-size: 13px; font-weight: 600; }
+  .comm-stats .sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  .comm-stats .metrics {
+    margin-left: auto;
+    display: flex; gap: 16px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .comm-stats .metrics .m-val { color: var(--text-primary); font-weight: 600; font-size: 13px; }
+  .comm-stats .btn { margin-left: 8px; background: var(--accent); color: var(--bg-base); }
+
+  .divider-label {
+    margin-top: 36px;
+    font-size: 12px;
+    color: var(--text-muted);
+    letter-spacing: .5px;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- 侧边栏 -->
+  <div class="sidebar">
+    <div class="sidebar-item active">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      连接管理
+    </div>
+    <div class="sidebar-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 10v6m11-11h-6m-10 0H1"/></svg>
+      模型管理
+    </div>
+    <div class="sidebar-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>
+      激活
+    </div>
+  </div>
+
+  <!-- 主内容 -->
+  <div class="main">
+
+    <div class="page-title">
+      <b>连接管理</b> · 微信 / 服务号 / 企业微信 连接状态与配置
+    </div>
+
+    <!-- 渠道标签页 -->
+    <div class="channel-tabs">
+      <div class="channel-tab">微信</div>
+      <div class="channel-tab">服务号</div>
+      <div class="channel-tab active">企业微信</div>
+      <div class="channel-tab">飞书<span class="coming-tag">即将</span></div>
+      <div class="channel-tab">钉钉<span class="coming-tag">即将</span></div>
+    </div>
+
+    <!-- ============================================ -->
+    <!-- ===== 未连接状态 ===== -->
+    <!-- ============================================ -->
+    <div class="channel-card" style="position:relative;">
+      <div class="channel-card-head">
+        <div class="channel-icon" style="background:#ffffff;">
+          <svg viewBox="0 0 48 48" width="28" height="28" xmlns="http://www.w3.org/2000/svg">
+            <path d="M38.5 15.5c0-7.2-7.2-13-16-13S6.5 8.3 6.5 15.5c0 4.2 2.4 7.9 6.1 10.2l-.9 3.6 3.9-2.1c1.8.5 3.7.8 5.7.8h.2c.6 0 1.2 0 1.8-.1-.1-.5-.1-1-.1-1.5 0-7.2 7.2-13 16-13h.7c.1 0 .2 0 .3.1-.2-1.4-.3-2.7-.3-4z" fill="none" stroke="#2BB7E9" stroke-width="3" stroke-linejoin="round"/>
+            <path d="M24 23.5c-3.6 0-6.5 2.9-6.5 6.5s2.9 6.5 6.5 6.5 6.5-2.9 6.5-6.5c0-.6-.1-1.2-.2-1.7-.4.1-.7.2-1.1.2-1.4 0-2.6-.5-3.6-1.3-.4-.3-.4-.9 0-1.2.3-.2.6-.4 1-.5 2.6-.6 4.9-1.9 6.6-3.7-.8-3.1-3.6-5.1-7-5.1z" fill="#2BB7E9"/>
+            <path d="M24 23.5c.5 0 1 0 1.4.1C24.5 21.9 22.9 21 21 21c-2.5 0-4.6 1.7-5.1 4 .3-.2.7-.4 1.1-.5 2.6-.6 4.9-1.9 6.6-3.7.1 0 .2-.1.4-.1z" fill="#4DB848"/>
+            <path d="M30.5 27.3c-1.5.4-2.6.6-3.6.6-1.4 0-2.6-.5-3.6-1.3-.4-.3-.4-.9 0-1.2.3-.2.6-.4 1-.5 2.6-.6 4.9-1.9 6.6-3.7 1.7 1.8 2.8 4.2 2.8 6.8-.4-0-1.1-.2-2.2-.3z" fill="#F5C518"/>
+            <path d="M26.3 34.8c1 .9 2.3 1.5 3.7 1.5 1.6 0 3-.6 4.1-1.6-1.7 1.8-4.1 2.9-6.7 3-.1-.8-.4-1.7-.9-2.5-.4-.3-.4-.9 0-1.2.3-.2.6-.4 1-.5z" fill="#F26522"/>
+          </svg>
+        </div>
+        <div>
+          <div class="channel-card-title">企业微信</div>
+          <div class="channel-card-sub">wecom-cli 智能机器人 · 消息显示为你本人身份</div>
+        </div>
+        <div class="channel-status disconnected">
+          <span class="status-dot"></span>
+          <span>未连接</span>
+        </div>
+      </div>
+
+      <!-- 步骤 1：Bot ID -->
+      <div class="step-row active" id="wecomStep1">
+        <div class="step-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" width="16" height="16"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </div>
+        <div class="step-text">Bot ID</div>
+        <div class="step-action">
+          <input class="cred-input-inline" id="botIdInput" placeholder="粘贴 Bot ID" oninput="onStep1Input()" style="width:280px; padding:6px 10px; background:var(--bg-base); border:1px solid var(--border); border-radius:6px; color:var(--text-primary); font-family:monospace; font-size:12px;">
+        </div>
+        <div class="step-status" id="step1Status">待填写</div>
+      </div>
+
+      <!-- 步骤 2：Secret -->
+      <div class="step-row pending" id="wecomStep2">
+        <div class="step-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" width="16" height="16"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+        </div>
+        <div class="step-text">Secret</div>
+        <div class="step-action">
+          <input class="cred-input-inline" id="secretInput" type="password" placeholder="粘贴 Secret" oninput="onStep2Input()" style="width:280px; padding:6px 10px; background:var(--bg-base); border:1px solid var(--border); border-radius:6px; color:var(--text-primary); font-family:monospace; font-size:12px;">
+        </div>
+        <div class="step-status" id="step2Status">等待 Bot ID</div>
+      </div>
+
+      <!-- 步骤 3：扫码授权 -->
+      <div class="step-row pending" id="wecomStep3">
+        <div class="step-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" width="16" height="16"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3M14 17h3M17 14v3"/></svg>
+        </div>
+        <div class="step-text">扫码授权</div>
+        <div class="step-action">
+          <button class="btn btn-primary" id="genQrBtn" onclick="generateQr()" disabled>生成二维码</button>
+        </div>
+        <div class="step-status" id="step3Status">等待 Secret</div>
+      </div>
+      <!-- 扫码区 -->
+      <div class="qr-area" id="qrArea" style="display:none;">
+        <div class="qr-box">wecom-cli 授权二维码</div>
+        <div class="qr-tip">
+          用 <strong>你的企微账号</strong> 扫码<br>
+          授权该机器人给 MVP 使用
+        </div>
+        <div style="margin-top:10px;">
+          <button class="btn btn-primary" onclick="markAuthorized()">我已完成授权</button>
+        </div>
+      </div>
+
+      <!-- 完成状态 -->
+      <div class="done-area" id="doneArea" style="display:none; margin:12px 0 4px; padding:16px; background:var(--accent-soft); border:1px solid rgba(16,185,129,0.3); border-radius:8px;">
+        <div style="font-size:15px; font-weight:600; color:var(--accent); margin-bottom:4px;">✅ 企微连接已完成</div>
+        <div style="font-size:12px; color:var(--text-muted); line-height:1.6;">
+          机器人凭证由 wecom-cli 加密存储于本地，<strong style="color:var(--text-primary);">重启 MVP 无需重新配置</strong>。
+        </div>
+        <div style="margin-top:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="font-size:12px; color:var(--text-muted);">消息轮询</span>
+            <div class="switch" id="pollSwitch" onclick="togglePoll()"></div>
+            <select class="poll-select" style="width:auto; padding:5px 8px;">
+              <option>3 秒</option>
+              <option>5 秒</option>
+              <option>10 秒</option>
+            </select>
+          </div>
+          <button class="btn" style="color:var(--danger); border-color:rgba(239,68,68,0.4);" onclick="unbindWecom()">解绑机器人</button>
+        </div>
+      </div>
+
+    </div>
+
+
+  </div>
+</div>
+
+<script>
+  // 步骤 1：Bot ID 输入
+  function onStep1Input() {
+    const val = document.getElementById('botIdInput').value.trim();
+    const s1 = document.getElementById('wecomStep1');
+    const s2 = document.getElementById('wecomStep2');
+    if (val) {
+      s1.classList.remove('active'); s1.classList.add('done');
+      document.getElementById('step1Status').textContent = '已填写';
+      document.getElementById('step1Status').className = 'step-status ok';
+      s2.classList.remove('pending'); s2.classList.add('active');
+      document.getElementById('step2Status').textContent = '待填写';
+      document.getElementById('step2Status').className = 'step-status info';
+    } else {
+      s1.classList.remove('done'); s1.classList.add('active');
+      document.getElementById('step1Status').textContent = '待填写';
+      document.getElementById('step1Status').className = 'step-status';
+      s2.classList.remove('active', 'done'); s2.classList.add('pending');
+      document.getElementById('step2Status').textContent = '等待 Bot ID';
+      document.getElementById('step2Status').className = 'step-status';
+      checkQrBtn();
+    }
+    checkQrBtn();
+  }
+
+  // 步骤 2：Secret 输入
+  function onStep2Input() {
+    const val = document.getElementById('secretInput').value.trim();
+    const s2 = document.getElementById('wecomStep2');
+    const s3 = document.getElementById('wecomStep3');
+    if (val) {
+      s2.classList.remove('active'); s2.classList.add('done');
+      document.getElementById('step2Status').textContent = '已填写';
+      document.getElementById('step2Status').className = 'step-status ok';
+      s3.classList.remove('pending'); s3.classList.add('active');
+      document.getElementById('step3Status').textContent = '可生成二维码';
+      document.getElementById('step3Status').className = 'step-status info';
+    } else {
+      s2.classList.remove('done'); s2.classList.add('active');
+      document.getElementById('step2Status').textContent = '待填写';
+      document.getElementById('step2Status').className = 'step-status info';
+      s3.classList.remove('active', 'done'); s3.classList.add('pending');
+      document.getElementById('step3Status').textContent = '等待 Secret';
+      document.getElementById('step3Status').className = 'step-status';
+    }
+    checkQrBtn();
+  }
+
+  // 检查二维码按钮是否可用
+  function checkQrBtn() {
+    const botId = document.getElementById('botIdInput').value.trim();
+    const secret = document.getElementById('secretInput').value.trim();
+    document.getElementById('genQrBtn').disabled = !(botId && secret);
+  }
+
+  // 步骤 3：生成二维码
+  function generateQr() {
+    document.getElementById('qrArea').style.display = 'block';
+    document.getElementById('genQrBtn').disabled = true;
+    document.getElementById('genQrBtn').textContent = '二维码已生成';
+    document.getElementById('step3Status').textContent = '等待扫码';
+    document.getElementById('step3Status').className = 'step-status info';
+  }
+
+  // 完成授权
+  function markAuthorized() {
+    document.getElementById('qrArea').style.display = 'none';
+    const s3 = document.getElementById('wecomStep3');
+    s3.classList.remove('active'); s3.classList.add('done');
+    document.getElementById('step3Status').textContent = '已授权';
+    document.getElementById('step3Status').className = 'step-status ok';
+    document.getElementById('doneArea').style.display = 'block';
+  }
+
+  // 开关轮询
+  function togglePoll() {
+    const sw = document.getElementById('pollSwitch');
+    sw.classList.toggle('on');
+  }
+
+  // 解绑机器人
+  function unbindWecom() {
+    if (!confirm('确认解绑企微机器人？解绑后需重新填写 Bot ID / Secret 并扫码授权。')) return;
+    // 重置所有步骤
+    document.getElementById('doneArea').style.display = 'none';
+    document.getElementById('botIdInput').value = '';
+    document.getElementById('secretInput').value = '';
+    // 重置步骤1
+    const s1 = document.getElementById('wecomStep1');
+    s1.classList.remove('done'); s1.classList.add('active');
+    document.getElementById('step1Status').textContent = '待填写';
+    document.getElementById('step1Status').className = 'step-status';
+    // 重置步骤2
+    const s2 = document.getElementById('wecomStep2');
+    s2.classList.remove('done', 'active'); s2.classList.add('pending');
+    document.getElementById('step2Status').textContent = '等待 Bot ID';
+    document.getElementById('step2Status').className = 'step-status';
+    // 重置步骤3
+    const s3 = document.getElementById('wecomStep3');
+    s3.classList.remove('done', 'active'); s3.classList.add('pending');
+    document.getElementById('step3Status').textContent = '等待 Secret';
+    document.getElementById('step3Status').className = 'step-status';
+    document.getElementById('genQrBtn').disabled = true;
+    document.getElementById('genQrBtn').textContent = '生成二维码';
+  }
+</script>
+</body>
+</html>
