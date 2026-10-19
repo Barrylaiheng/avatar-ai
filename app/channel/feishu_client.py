@@ -125,7 +125,7 @@ class FeishuClient:
         try:
             proc = subprocess.run(
                 [self._cli, "auth", "status", "--json"],
-                capture_output=True, text=True, timeout=10, encoding="utf-8"
+                capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace"
             )
             if proc.returncode == 0:
                 data = json.loads(proc.stdout.strip())
@@ -241,13 +241,13 @@ class FeishuClient:
                 "--text", text,
                 "--as", auth_mode,
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=30, encoding="utf-8")
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=30)
             if proc.returncode != 0 and auth_mode == "user":
                 # user 身份失败，fallback bot 身份
                 cmd[-1] = "bot"
-                proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      timeout=30, encoding="utf-8")
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                      timeout=30)
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "").strip()[:200]
                 print(f"[Feishu] send_reply 失败: {err}", flush=True)
@@ -278,7 +278,7 @@ class FeishuClient:
         def _run(args):
             proc = subprocess.run(
                 [self._cli] + args,
-                capture_output=True, text=True, timeout=30, encoding="utf-8",
+                capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace",
             )
             if proc.returncode != 0:
                 return None
@@ -389,7 +389,7 @@ class FeishuClient:
         try:
             proc = subprocess.run(
                 [self._cli, "auth", "status", "--json"],
-                capture_output=True, text=True, timeout=10, encoding="utf-8"
+                capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace"
             )
             if proc.returncode == 0:
                 data = json.loads(proc.stdout.strip())
@@ -439,7 +439,7 @@ class FeishuClient:
         try:
             r = subprocess.run(
                 [cli, "auth", "check", "--scope", " ".join(FEISHU_REQUIRED_SCOPES)],
-                capture_output=True, text=True, timeout=10, encoding="utf-8",
+                capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace",
             )
             data = _json.loads(r.stdout)
             missing = data.get("missing") or []
@@ -533,7 +533,7 @@ class FeishuClient:
                  "--order", "asc",
                  "--page-size", "50",
                  "--as", auth_mode],
-                capture_output=True, text=True, timeout=30, encoding="utf-8"
+                capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace"
             )
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "").strip()[:200]

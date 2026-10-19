@@ -116,7 +116,7 @@ class WcfClient:
         try:
             out = _sp.run(
                 ["tasklist", "/fi", "imagename eq WeChat.exe", "/fo", "csv"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             ).stdout or ""
             if "WeChat.exe" not in out:
                 _progress("failed", "微信未运行，请先打开微信并登录")
@@ -365,7 +365,7 @@ class WcfClient:
             import subprocess as _sp
             out = _sp.run(
                 ["tasklist", "/fi", "imagename eq WeChat.exe", "/fo", "csv", "/v"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             ).stdout or ""
             if "WeChat.exe" in out:
                 lines = [l for l in out.splitlines() if "WeChat.exe" in l]
@@ -544,7 +544,7 @@ class WcfClient:
         """
         try:
             out = subprocess.run(
-                ["netstat", "-ano"], capture_output=True, text=True, timeout=5,
+                ["netstat", "-ano"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             ).stdout or ""
         except Exception:
             return None
@@ -597,7 +597,7 @@ class WcfClient:
         try:
             out = _sp.run(
                 ["tasklist", "/fi", "imagename eq WeChat.exe", "/fo", "csv"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             ).stdout or ""
             wechat_running = "WeChat.exe" in out
         except Exception:

@@ -48,8 +48,8 @@ def _run_cli(cmd: list, timeout: int = CLI_TIMEOUT) -> tuple[dict | None, str]:
     """执行 CLI，返回 (data|None, 错误信息)。超时兜底，不抛异常。"""
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", **_spawn_kwargs(),
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            **_spawn_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return None, f"CLI 超时（{timeout}s）"

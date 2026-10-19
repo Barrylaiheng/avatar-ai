@@ -93,7 +93,7 @@ def _run_dws_api(method: str, path: str, data: dict | None = None) -> Optional[d
     if data is not None:
         cmd += ["--data", json.dumps(data, ensure_ascii=False)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=HTTP_TIMEOUT)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=HTTP_TIMEOUT)
         if r.returncode != 0:
             print(f"[MediaDownloader] dws api 失败: {r.stderr[:300]}", flush=True)
             return None
@@ -157,7 +157,7 @@ def _download_dingtalk_dws_cli(resource_id: str, open_message_id: str,
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
             cwd=str(out_dir.parent),
         )
         if result.returncode != 0:
@@ -293,7 +293,7 @@ def download_feishu(message_id: str, file_key: str, filename: str = "") -> Optio
                 "--output", str(out_path),
                 "--as", "user",
             ],
-            capture_output=True, text=True, timeout=30, encoding="utf-8",
+            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace",
         )
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()[:300]

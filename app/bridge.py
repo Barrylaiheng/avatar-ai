@@ -2442,9 +2442,7 @@ class BridgeServer(QObject):
                 [cli_path, "auth", "init", "--noninteractive", "--no-browser"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=True, encoding="utf-8", errors="replace",
                 bufsize=1,
             )
         except Exception as e:
@@ -2592,8 +2590,7 @@ class BridgeServer(QObject):
         try:
             proc = subprocess.run(
                 [cli_path, *args],
-                capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
@@ -2918,9 +2915,7 @@ class BridgeServer(QObject):
                 [cli_path, "config", "init", "--new"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=True, encoding="utf-8", errors="replace",
                 bufsize=1,
             )
         except Exception as e:
@@ -3149,9 +3144,7 @@ class BridgeServer(QObject):
                 [cli_path, "auth", "login", "--device", "--no-browser"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=True, encoding="utf-8", errors="replace",
                 bufsize=1,
             )
         except Exception as e:
@@ -3270,7 +3263,7 @@ class BridgeServer(QObject):
                         import subprocess
                         result = subprocess.run(
                             [cli_path, "auth", "logout"],
-                            capture_output=True, text=True, timeout=10,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
                         )
                         print(f"[Bridge] Dingtalk logout: {result.stdout.strip()[:100]} {result.stderr.strip()[:100]}", flush=True)
                     except Exception as e:

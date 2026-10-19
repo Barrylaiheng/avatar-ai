@@ -289,8 +289,8 @@ class WecomClient:
         if json_params is not None:
             cmd += ["--json", json.dumps(json_params, ensure_ascii=False)]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout, encoding="utf-8")
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=timeout)
         except subprocess.TimeoutExpired:
             return False, None, f"wecom-cli 超时（{timeout}s）"
         except Exception as e:

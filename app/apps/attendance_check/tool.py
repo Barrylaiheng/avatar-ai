@@ -50,8 +50,8 @@ def _cli_run(*args, timeout: int = 30) -> tuple[bool, dict | None, str]:
     cmd = [_dws_cli_path(), *args, "--format", "json"]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", creationflags=_CREATE_NO_WINDOW,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:
         return False, None, f"CLI 超时 ({timeout}s)"

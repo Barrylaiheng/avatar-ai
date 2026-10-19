@@ -35,7 +35,7 @@ def _run_powershell(cmd: str, timeout: float = 20.0) -> str:
         creationflags = 134217728  # CREATE_NO_WINDOW
         result = subprocess.run(
             ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             startupinfo=startupinfo, creationflags=creationflags,
         )
         return (result.stdout or "").strip()
