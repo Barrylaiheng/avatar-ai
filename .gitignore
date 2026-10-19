@@ -51,14 +51,18 @@ app/storage/_secrets.py
 secrets.json
 *.pem
 
-# =============== 临时脚本（开发调试用，不进仓库） ===============
-# 注意：只忽略仓库【根目录】下的下划线脚本；不要写成 `_*.py`，
+# =============== 临时脚本 / 过程产物（开发调试用，不进仓库） ===============
+# 注意：只忽略仓库【根目录】下的下划线开头项；不要写成 `_*.py`，
 # 否则会连 app/ 下所有包文件 `__init__.py`（以及 app/apps/_scheduler_common.py）一起忽略掉。
-/_*.py
-tests/_smoke_*.py
+/_*
+**/tests/_smoke_*.py
 
-# =============== 抢救/审计过程产物（不发布） ===============
-/recovered_full/
+# =============== 抢救/审计过程产物、解包产物（不发布） ===============
+/*.exe_extracted/
+/pycd*.exe
+/AIBridgeConsole_MVP_Test_20260729/
+/recovered_repo/
+/recovered_source/
 
 # =============== 日志 ===============
 *.log
