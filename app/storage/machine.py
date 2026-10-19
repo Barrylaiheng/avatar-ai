@@ -19,10 +19,14 @@ import uuid
 _CACHED_CODE: str | None = None
 
 
-def _run_powershell(cmd: str, timeout: float = 5.0) -> str:
+def _run_powershell(cmd: str, timeout: float = 20.0) -> str:
     """执行 PowerShell 命令，返回 stdout（去空白）。失败返回空串。
 
     用 CREATE_NO_WINDOW 阻止任何黑框弹出（PyInstaller打包后更关键）。
+
+    超时默认 20s（原为 5s）：onefile exe 冷启动时首次拉起 PowerShell +
+    CIM 服务暖机常需 1.5s 以上，极端情况超过 5s；超时会导致硬件指纹拉取失败、
+    降级成 MAC+主机名的弱指纹 → 机器码与用户激活时不一致 → 授权被降级。
     """
     try:
         # 创建子进程，无窗口，避免弹出黑框

@@ -16,6 +16,15 @@ from pathlib import Path
 def _patch_subprocess_no_window():
     import subprocess as _sp
 
+    # 关键顺序：必须先把 asyncio 导入好，再替换 subprocess.Popen。
+    # Windows 上 asyncio/windows_utils.py 会执行 `class Popen(subprocess.Popen)`，
+    # 若 subprocess.Popen 已被替换成普通函数，子类化会抛
+    # `TypeError: function() argument 'code' must be code, not str`，
+    # 导致此后任何首次 `import asyncio` 全部失败（APScheduler 就依赖
+    # `from asyncio import iscoroutinefunction`；原版日志里的
+    # 「[Schedule DEBUG] pre-import asyncio FAIL」正是这一步踩的坑）。
+    import asyncio  # noqa: F401  预导入，后续 import asyncio 走缓存，不再触发子类化
+
     _NOWIN = 0x08000000
 
     def _ensure(call):
