@@ -118,13 +118,13 @@ AI 学习你或团队的语气、习惯、偏好——回复不像机器人，�
 7. 让它跑起来
 ```
 
-## 关于代码
+## 关于本项目
 
-**本仓库仅包含可公开的部分**：产品文档、README、工作流配置。核心代码闭源，通过 Release 分发可执行文件（PyInstaller 单文件 EXE）。
+**Avatar AI 是闭源商业软件**，核心代码不公开。本仓库仅提供产品介绍和 Release 下载入口。
 
-- Release 页面：<https://github.com/Barrylaiheng/avatar-ai/releases>
-- Bug 反馈：<https://github.com/Barrylaiheng/avatar-ai/issues>
-- 功能建议：欢迎 Issue / PR 讨论，但不接受核心代码的 PR
+- 最新下载：<https://github.com/Barrylaiheng/avatar-ai/releases/latest>
+- 历史版本：<https://github.com/Barrylaiheng/avatar-ai/releases>
+- Bug 反馈 / 功能建议：<https://github.com/Barrylaiheng/avatar-ai/issues>
 
 ## 常见问题
 
@@ -134,7 +134,7 @@ AI 学习你或团队的语气、习惯、偏好——回复不像机器人，�
 
 > **免费版和付费版有什么区别？**
 
-看上面的权益表。免费版 2 个智能体、不能用知识库/记忆/应用市场，但能正常对接公众号、企微、飞书、钉钉。
+免费版 2 个智能体、不能用知识库/记忆/应用市场，但能正常对接公众号、企微、飞书、钉钉。升级权益详情见 App 内「权益管理」页面。
 
 > **要不要懂 prompt engineering？**
 
@@ -155,7 +155,7 @@ AI 学习你或团队的语气、习惯、偏好——回复不像机器人，�
 - ✅ 修复 gear 弹窗点遮罩意外关闭、按钮文字不居中
 - ✅ 修复 appsToggleGate checkbox 不真正 toggle 的 bug
 - ✅ tab 顺序：应用调到内容管理前
-- ✅ MVP 打包 PyInstaller 完整适配（asyncio / wcferry / 10 个应用 runner hidden-import 全覆盖）
+- ✅ MVP 打包 PyInstaller 完整适配（asyncio / 10 个应用 runner hidden-import 全覆盖）
 - ✅ 另一台 Windows 纯环境真机验证通过
 
 ### v2.9.x 及更早
