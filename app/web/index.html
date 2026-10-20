@@ -31471,7 +31471,9 @@ function refreshActivationCard(act) {
 function copyMachineCode() {
   const mc = document.getElementById('statusMachineCode');
   if (!mc || !mc.textContent || mc.textContent === '—') { showToast('机器码尚未生成'); return; }
-  navigator.clipboard.writeText(mc.textContent).then(() => showToast('机器码已复制', 1500));
+  // 跟 MCP 复制按钮同理：QtWebEngine + file:// 下 navigator.clipboard 静默失败，
+  // 统一走全站验证过的 _copyTextFallback（execCommand）。
+  _copyTextFallback(mc.textContent, '机器码已复制');
 }
 
 
