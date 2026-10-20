@@ -102,16 +102,18 @@ class MCPManager:
         enabled = self.is_enabled()
         token = self.get_or_generate_token() if enabled else (self.get("token") or "")
         py = sys.executable or "python"
-        project_root = str(Path(__file__).parent.parent)
+        env = {"MCP_TOKEN": token}
+        # PYTHONPATH 只在开发版（源码运行）有意义：让 `python -m app.mcp_server` 找得到项目根。
+        # 打包版（frozen）自带 bootloader 做模块加载，这时 __file__ 在 _MEIPASS 临时目录里，
+        # 写进配置就会给用户看到一个「关掉应用就失效」的临时路径 —— 纯垃圾字段，干脆不写。
+        if not getattr(sys, "frozen", False):
+            env["PYTHONPATH"] = str(Path(__file__).parent.parent)
         install_cfg = {
             "mcpServers": {
                 "Avatar AI": {
                     "command": py,
                     "args": ["-m", "app.mcp_server"],
-                    "env": {
-                        "MCP_TOKEN": token,
-                        "PYTHONPATH": project_root,
-                    },
+                    "env": env,
                 }
             }
         }
