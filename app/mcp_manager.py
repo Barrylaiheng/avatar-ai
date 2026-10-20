@@ -55,6 +55,40 @@ def _ensure_conn() -> sqlite3.Connection:
         return _CONN
 
 
+def _short_path(path: str) -> str:
+    """取 Windows 8.3 短路径（不含空格）。取不到返回空字符串。"""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024)
+        if n and buf.value and buf.value != path:
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+def _spawnable_exe(path: str) -> str:
+    """把 exe 路径转成 MCP 客户端能直接启动的写法。
+
+    难点：不同客户端启动方式不同，对空格的要求正好相反 ——
+      · Trae 把 command 拼成命令行交给 cmd.exe 执行：
+        路径含空格不加引号会在空格处断开（报「不是内部或外部命令」）。
+      · WorkBuddy 按 argv 直接启动进程（其官方连接器里带空格的
+        "C:\\Program Files\\NVIDIA Corporation\\...\\NvAppMcpServer.exe"
+        就是不加引号的），加了引号会变成文件名的一部分而找不到文件。
+
+    最稳的中间解：优先用 8.3 短路径 —— 不含空格，两种启动方式都能跑。
+    取不到短路径时，才退化成「含空格就加引号」（先保住 Trae）。
+    """
+    short = _short_path(path)
+    if short and " " not in short:
+        return short
+    if " " in path and not (path.startswith('"') and path.endswith('"')):
+        return '"' + path + '"'
+    return path
+
+
 class MCPManager:
     """MCP 配置管理 + server 进程/线程控制。"""
 
@@ -101,13 +135,9 @@ class MCPManager:
         import json as _json
         enabled = self.is_enabled()
         token = self.get_or_generate_token() if enabled else (self.get("token") or "")
-        py = sys.executable or "python"
-        # 路径带空格时必须整体加引号：Trae / WorkBuddy 这类客户端会把 command
-        # 直接拼进命令行执行，不加引号就会在空格处断开
-        # （"Avatar AI.exe" → 只执行 "...\Avatar"，报「不是内部或外部命令」）。
-        # 与 Trae 自带 connector 的写法一致：command 值是 "\"C:\\...\\xxx.exe\""。
-        if " " in py and not (py.startswith('"') and py.endswith('"')):
-            py = '"' + py + '"'
+        # 路径带空格的处理交给 _spawnable_exe：优先 8.3 短路径（Trae 和 WorkBuddy
+        # 两种启动方式都认），取不到才退化成加引号（见该函数说明）。
+        py = _spawnable_exe(sys.executable or "python")
         env = {"MCP_TOKEN": token}
         # PYTHONPATH 只在开发版（源码运行）有意义：让 `python -m app.mcp_server` 找得到项目根。
         # 打包版（frozen）自带 bootloader 做模块加载，这时 __file__ 在 _MEIPASS 临时目录里，
