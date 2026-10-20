@@ -6,7 +6,7 @@
 > 
 > **免费版可长期使用**（不是试用版）。
 
-![Version](https://img.shields.io/badge/version-v2.10.0-4a90d9)
+![Version](https://img.shields.io/badge/version-v2.10.1-4a90d9)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![License](https://img.shields.io/badge/license-Proprietary%20%2F%20Free%20for%20Personal-lightgrey)
 ![Release](https://img.shields.io/github/v/release/Barrylaiheng/avatar-ai?label=release&sort=semver)
