@@ -11,7 +11,7 @@ a = Analysis(
     ['bootloader.py'],
     pathex=[],
     binaries=[],
-    datas=[('app\\__pycache__', 'app\\__pycache__'), ('app\\channel\\__pycache__', 'app\\channel\\__pycache__'), ('app\\storage\\__pycache__', 'app\\storage\\__pycache__'), ('app\\apps', 'app\\apps'), ('app\\web', 'app\\web')],
+    datas=[('app\\__pycache__', 'app\\__pycache__'), ('app\\channel\\__pycache__', 'app\\channel\\__pycache__'), ('app\\storage\\__pycache__', 'app\\storage\\__pycache__'), ('app\\apps', 'app\\apps'), ('app\\web', 'app\\web'), ('avatar_icon.ico', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -41,4 +41,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['avatar_icon.ico'],
 )
