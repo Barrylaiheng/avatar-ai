@@ -23846,23 +23846,14 @@ function _fillMcpPrompt() {
 }
 
 // 通用复制：把指定元素的文字内容写进剪贴板（步骤 2 配置块 / 步骤 3 话术共用）
+// 注意：不要走 navigator.clipboard —— QWebEngine + file:// 下它对象存在但静默失败，
+// 既不 resolve 也不触发 catch，导致按钮看着点了、别处 Ctrl+V 却粘不出内容。
+// 统一复用全站已验证的 _copyTextFallback（execCommand 路线）。
 function copyTextFrom(id) {
   const el = document.getElementById(id);
   const text = (el && el.textContent) || '';
   if (!text) return;
-  const done = () => showToast('已复制到剪贴板', 1500);
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done).catch(() => {
-      // 降级：QWebEngine 里 clipboard API 可能被拦，走 execCommand
-      const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
-      ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-      done();
-    });
-  } else {
-    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
-    ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-    done();
-  }
+  _copyTextFallback(text, '已复制到剪贴板');
 }
 
 // 监听 get_mcp_config / set_mcp_config 返回
