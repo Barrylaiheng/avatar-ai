@@ -18779,21 +18779,22 @@ body.debug-drag-in-progress, body.debug-drag-in-progress * {
                   <div style="font-size:12px; font-weight:600; margin-bottom:2px;">复制下面的配置块，粘贴到 MCP connector 里</div>
                   <div style="display:flex; gap:6px; align-items:flex-start; margin-top:6px;">
                     <pre id="mcpInstallString" style="flex:1; margin:0; padding:10px 12px; background:var(--bg-elevated); border:1px solid var(--border); border-radius:8px; font-size:11px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; font-family:'Consolas','SF Mono',monospace; max-height:180px; overflow:auto;"></pre>
-                    <button class="btn btn-ghost" onclick="copyMcpString()" style="flex-shrink:0;">复制</button>
+                    <button class="btn btn-ghost" onclick="copyTextFrom('mcpInstallString')" style="flex-shrink:0;">复制</button>
                   </div>
                 </div>
               </div>
 
-              <!-- 步骤 3：验证 -->
+              <!-- 步骤 3：第一次对话（复制话术，触发首次握手 + 让 AI 交代使用说明） -->
               <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:12px;">
                 <div style="flex-shrink:0; width:22px; height:22px; border-radius:50%; background:var(--accent); color:#fff; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center;">3</div>
-                <div style="flex:1; font-size:12px; line-height:1.7;">
-                  <div style="font-weight:600; margin-bottom:2px;">在 AI Agent 对话里测试</div>
-                  <div style="color:var(--text-muted);">
-                    配完后在 AI Agent 里说一句：<br>
-                    <code style="background:var(--bg-elevated); padding:2px 6px; border-radius:4px; font-size:11px;">列出阿维达里的应用</code> 或 <code style="background:var(--bg-elevated); padding:2px 6px; border-radius:4px; font-size:11px;">帮我加一个XX应用到阿维达</code><br>
-                    AI Agent 能正常响应 = 连通成功。
+                <div style="flex:1; min-width:0;">
+                  <div style="font-size:12px; font-weight:600; margin-bottom:2px;">复制这段话，发到 AI Agent 的对话框里（第一次对话）</div>
+                  <div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;">AI Agent 会跟阿维达完成首次握手，并告诉你这个 MCP 能做什么、怎么用。</div>
+                  <div style="display:flex; gap:6px; align-items:flex-start; margin-top:6px;">
+                    <pre id="mcpPromptString" style="flex:1; margin:0; padding:10px 12px; background:var(--bg-elevated); border:1px solid var(--border); border-radius:8px; font-size:11px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; font-family:'Consolas','SF Mono',monospace; max-height:180px; overflow:auto;"></pre>
+                    <button class="btn btn-ghost" onclick="copyTextFrom('mcpPromptString')" style="flex-shrink:0;">复制</button>
                   </div>
+                  <div style="font-size:11px; color:var(--text-muted); margin-top:6px;">AI Agent 能正常响应 = 连通成功。</div>
                 </div>
               </div>
 
@@ -23818,6 +23819,7 @@ function selectSettingsSection(section) {
 
 function refreshMCPConfig() {
   if (!window.pyqtBridge) return;
+  _fillMcpPrompt();
   pyqtBridge.call('get_mcp_config', {});
 }
 
@@ -23828,20 +23830,37 @@ function toggleMCP() {
   pyqtBridge.call('set_mcp_config', { enabled: !currentOn });
 }
 
-function copyMcpString() {
-  const el = document.getElementById('mcpInstallString');
-  const text = el.textContent || '';
+// 首次对话话术 —— 步骤 3 复制框的内容。
+// 贴进 AI Agent 对话框后，它会跟阿维达 MCP 完成首次握手，并交代使用说明
+// （服务端握手时也会随 initialize 返回一段 instructions，双保险）。
+const MCP_FIRST_PROMPT = [
+  '你好，我刚在阿维达AI 里配好了这个 MCP 连接。',
+  '请先用几句话告诉我：这个 MCP 能帮我做什么、怎么用，',
+  '然后列出阿维达里已有的应用。'
+].join('\n');
+
+function _fillMcpPrompt() {
+  const el = document.getElementById('mcpPromptString');
+  if (el && !el.textContent.trim()) el.textContent = MCP_FIRST_PROMPT;
+}
+
+// 通用复制：把指定元素的文字内容写进剪贴板（步骤 2 配置块 / 步骤 3 话术共用）
+function copyTextFrom(id) {
+  const el = document.getElementById(id);
+  const text = (el && el.textContent) || '';
+  if (!text) return;
+  const done = () => showToast('已复制到剪贴板', 1500);
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => showToast('已复制到剪贴板', 1500)).catch(() => {
-      // fallback
+    navigator.clipboard.writeText(text).then(done).catch(() => {
+      // 降级：QWebEngine 里 clipboard API 可能被拦，走 execCommand
       const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
       ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-      showToast('已复制到剪贴板', 1500);
+      done();
     });
   } else {
     const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
     ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-    showToast('已复制到剪贴板', 1500);
+    done();
   }
 }
 

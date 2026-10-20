@@ -19,7 +19,20 @@ if str(_project_root) not in sys.path:
 
 from mcp_manager import get_mcp_manager
 
-mcp = MCPServer('Avida-MCP')
+# 握手说明：MCP 客户端（Trae / WorkBuddy 等）在 initialize 时就会拿到这段，
+# 让 AI Agent 第一次连上就知道这个 MCP 能干嘛、怎么用，不用用户自己去解释。
+_MCP_INSTRUCTIONS = (
+    '这是「阿维达AI」的本地 MCP 开发助手，用来在阿维达应用市场里开发和管理应用。'
+    '常用工具：check_mcp_capabilities（先查这个 MCP 的能力边界，判断需求能不能做）、'
+    'list_apps（列出阿维达里已有的应用）、get_app（看单个应用详情）、'
+    'register_app（注册一个新应用，会自动生成 tool.py / runner.py 并挂到应用市场）、'
+    'toggle_app（给某个智能体启/停某个应用）、run_app（运行应用）、delete_app（删除自建应用）。'
+    '边界：MCP 只支持「LLM function calling → call_tool → 执行业务逻辑」这类能力；'
+    '改 AI 人设 / 知识库检索逻辑 / 风控规则、拦截消息流、注册长期后台进程都超出边界。'
+    '首次连接时，请先用一两句话向用户说明这个 MCP 能做什么、怎么用，再开始干活。'
+)
+
+mcp = MCPServer('Avida-MCP', instructions=_MCP_INSTRUCTIONS)
 
 
 _APPS_DIR = Path(__file__).parent / 'apps'
