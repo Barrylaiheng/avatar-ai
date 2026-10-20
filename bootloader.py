@@ -44,13 +44,31 @@ def resolve_path(rel_path):
     return candidates[0]  # 返回最后一个（让它抛 FileNotFound）
 
 # ---- 包容器 ----
+# 注意：'app' / 'app.storage' / 'app.channel' 必须带 __path__，成为「真正的包」。
+# 否则运行期动态导入会失败：应用市场 app_registry 的 tool_fn/runner_fn 是
+# "app.apps.<id>.tool:call_tool" 这类字符串引用，解析时要用 importlib.import_module，
+# 而容器模块没有 __path__ 时会报 `module 'app' has no attribute '__path__'`
+# → 应用市场拿到空列表（前端显示「没有应用」）。
+_PKG_DIRS = {
+    'app': 'app',
+    'app.storage': 'app/storage',
+    'app.channel': 'app/channel',
+    'storage': 'app/storage',
+    'channel': 'app/channel',
+}
 for p in ['app', 'app.storage', 'app.channel', 'storage', 'channel',
           'storage.cloud_license', 'storage.retriever', 'storage.doc_parser',
           'storage.llm_provider', 'channel.wcf_client', 'channel.oa_client',
           'channel.wecom_client', 'channel.feishu_client', 'channel.dingtalk_client',
           'channel.message_pipeline', 'app_registry', 'mcp_manager', 'bridge',
           'logger', 'health']:
-    sys.modules.setdefault(p, type(sys)(p))
+    if p in sys.modules:
+        continue
+    _m = type(sys)(p)
+    _d = _PKG_DIRS.get(p)
+    if _d:
+        _m.__path__ = [resolve_path(_d)]
+    sys.modules[p] = _m
 
 # ---- 加载顺序 ----
 LOAD_ORDER = [

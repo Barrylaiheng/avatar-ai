@@ -7693,7 +7693,10 @@ class BridgeServer(QObject):
     # ---------- 应用市场 ----------
     def _handle_list_apps(self, payload):
         import importlib, app_registry as _ar
-        importlib.reload(_ar)
+        try:
+            importlib.reload(_ar)   # 打包产物里 app_registry 是 datas 中的 pyc，reload 找不到 spec；
+        except Exception as _e:      # 刷新只是为了让运行期新注册的应用生效，失败不应拖垮整个市场接口
+            print(f"[Bridge] app_registry reload 跳过：{_e}", flush=True)
         from storage import app_credential_dao
         apps = []
         for app_meta in _ar.list_apps():
@@ -7714,7 +7717,10 @@ class BridgeServer(QObject):
     def _handle_toggle_agent_app(self, payload):
         import importlib
         from app.app_registry import app_registry as _ar
-        importlib.reload(_ar)
+        try:
+            importlib.reload(_ar)   # 同 _handle_list_apps：打包环境下 reload 不可用，失败跳过
+        except Exception as _e:
+            print(f"[Bridge] app_registry reload 跳过：{_e}", flush=True)
         from storage import app_credential_dao, agent_app_dao
         agent_id = payload.get('agent_id')
         app_id = payload.get('app_id')
