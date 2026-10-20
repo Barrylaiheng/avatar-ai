@@ -11,7 +11,7 @@ a = Analysis(
     ['bootloader.py'],
     pathex=[],
     binaries=[],
-    datas=[('app\\__pycache__', 'app\\__pycache__'), ('app\\channel\\__pycache__', 'app\\channel\\__pycache__'), ('app\\storage\\__pycache__', 'app\\storage\\__pycache__'), ('app\\apps', 'app\\apps'), ('app\\web', 'web'), ('avatar_icon.ico', '.')],
+    datas=[('app\\__pycache__', 'app\\__pycache__'), ('app\\channel\\__pycache__', 'app\\channel\\__pycache__'), ('app\\storage\\__pycache__', 'app\\storage\\__pycache__'), ('app\\apps', 'app\\apps'), ('app\\web', 'web'), ('channels', 'channels'), ('avatar_icon.ico', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

@@ -11,6 +11,8 @@ env/
 # =============== PyInstaller 打包产物 ===============
 build/
 dist/
+/dist_v*/
+/build_v*/
 *.spec
 
 # =============== IDE ===============
@@ -56,6 +58,11 @@ secrets.json
 # 否则会连 app/ 下所有包文件 `__init__.py`（以及 app/apps/_scheduler_common.py）一起忽略掉。
 /_*
 **/tests/_smoke_*.py
+
+# =============== 渠道 CLI 二进制（打包必需，但不进 git，只保留本地） ===============
+# dws.exe / lark-cli.exe / wecom-cli.exe 合计约 90MB，spec 会打进 EXE 的
+# channels/ 目录；仓库里不跟踪，换机器时需从官方安装包重新解出。
+/channels/
 
 # =============== 抢救/审计过程产物、解包产物（不发布） ===============
 /*.exe_extracted/
