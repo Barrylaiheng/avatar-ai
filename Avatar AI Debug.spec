@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['asyncio.base_events', 'qrcode', 'jwt', 'flask', 'wechatpy', 'mcp.server.mcpserver', 'mcp.server.fastmcp']
+hiddenimports = ['asyncio.base_events', 'sqlite3', '_sqlite3', 'qrcode', 'jwt', 'flask', 'wechatpy', 'mcp.server.mcpserver', 'mcp.server.fastmcp']
 hiddenimports += collect_submodules('asyncio')
 hiddenimports += collect_submodules('PyQt6')
 hiddenimports += collect_submodules('wcferry')
@@ -11,7 +11,7 @@ a = Analysis(
     ['bootloader.py'],
     pathex=[],
     binaries=[],
-    datas=[('app\\__pycache__', 'app\\__pycache__'), ('app\\channel\\__pycache__', 'app\\channel\\__pycache__'), ('app\\storage\\__pycache__', 'app\\storage\\__pycache__'), ('app\\apps', 'app\\apps'), ('app\\web', 'app\\web'), ('avatar_icon.ico', '.')],
+    datas=[('app\\__pycache__', 'app\\__pycache__'), ('app\\channel\\__pycache__', 'app\\channel\\__pycache__'), ('app\\storage\\__pycache__', 'app\\storage\\__pycache__'), ('app\\apps', 'app\\apps'), ('app\\web', 'web'), ('avatar_icon.ico', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
