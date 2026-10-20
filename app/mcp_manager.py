@@ -102,6 +102,12 @@ class MCPManager:
         enabled = self.is_enabled()
         token = self.get_or_generate_token() if enabled else (self.get("token") or "")
         py = sys.executable or "python"
+        # 路径带空格时必须整体加引号：Trae / WorkBuddy 这类客户端会把 command
+        # 直接拼进命令行执行，不加引号就会在空格处断开
+        # （"Avatar AI.exe" → 只执行 "...\Avatar"，报「不是内部或外部命令」）。
+        # 与 Trae 自带 connector 的写法一致：command 值是 "\"C:\\...\\xxx.exe\""。
+        if " " in py and not (py.startswith('"') and py.endswith('"')):
+            py = '"' + py + '"'
         env = {"MCP_TOKEN": token}
         # PYTHONPATH 只在开发版（源码运行）有意义：让 `python -m app.mcp_server` 找得到项目根。
         # 打包版（frozen）自带 bootloader 做模块加载，这时 __file__ 在 _MEIPASS 临时目录里，
