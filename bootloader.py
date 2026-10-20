@@ -19,6 +19,57 @@ import importlib.util
 if hasattr(sys, '_MEIPASS'):
     sys.path.insert(0, sys._MEIPASS)
 
+
+def _detect_mcp_mode(argv=None):
+    """判断本次启动是否为 MCP stdio 服务模式。
+
+    打包版（onefile exe）自身就是解释器，MCP 客户端（Trae / Wo Buddy）会执行
+        "Avatar AI.exe" -m app.mcp_server
+    这时代码必须直接进入 MCP 服务，而不是弹出 GUI。
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    if '--mcp-server' in argv:
+        return True
+    for i, a in enumerate(argv):
+        if a == '-m' and i + 1 < len(argv) and argv[i + 1].strip() in ('app.mcp_server', 'app/mcp_server'):
+            return True
+    return False
+
+
+# 模块级常量：main() 里要靠它决定走 MCP 还是 GUI
+_MCP_MODE = _detect_mcp_mode()
+
+# MCP 模式下不加载这两个模块：它们会把 PyQt6 / 整个 GUI 依赖拖进来，
+# 既拖慢握手速度，也让一个无界面的 stdio 子进程白白初始化 Qt。
+_MCP_SKIP = {'app.bridge', 'app.main'}
+
+
+def _log(msg):
+    """打印诊断信息。
+
+    MCP 模式下 stdout 是 JSON-RPC 数据通道，诊断信息必须走 stderr，
+    否则会污染协议流导致客户端握手失败。
+    """
+    stream = sys.stderr if _MCP_MODE else sys.stdout
+    if stream is None:
+        stream = sys.stdout
+    try:
+        print(msg, file=stream, flush=True)
+    except Exception:
+        pass
+
+
+def _ensure_stdio():
+    """windowed exe 下 stdin/stdout/stderr 可能为 None；stdio 协议必须有真实流。"""
+    for fd, name, mode in ((0, 'stdin', 'r'), (1, 'stdout', 'w'), (2, 'stderr', 'w')):
+        if getattr(sys, name, None) is not None:
+            continue
+        try:
+            setattr(sys, name, open(fd, mode, encoding='utf-8', errors='replace', closefd=False))
+        except Exception:
+            pass
+
+
 def load_pyc(name, path):
     """从 pyc 文件加载模块"""
     if name in sys.modules:
@@ -116,7 +167,7 @@ def _load_app_modules():
     """
     base = resolve_path('app/apps')
     if not base or not os.path.isdir(base):
-        print('[bootloader] app/apps 目录不存在，跳过应用市场加载', flush=True)
+        _log('[bootloader] app/apps 目录不存在，跳过应用市场加载')
         return
     # 注册包容器（带 __path__，供动态导入兜底）
     m = sys.modules.get('app.apps')
@@ -145,8 +196,8 @@ def _load_app_modules():
                 load_pyc(name, os.path.join(root, fn))
                 loaded += 1
             except Exception as e:
-                print(f'  WARN app module {name}: {e}', flush=True)
-    print(f'[bootloader] app.apps 模块加载 {loaded} 个', flush=True)
+                _log(f'  WARN app module {name}: {e}')
+    _log(f'[bootloader] app.apps 模块加载 {loaded} 个')
 
 
 def load_all() -> int:
@@ -154,9 +205,11 @@ def load_all() -> int:
 
     返回核心模块装载失败数。可脱离 GUI 单独调用，便于打包前自检。
     """
-    print('[Avatar AI bootloader] loading...', flush=True)
+    _log('[Avatar AI bootloader] loading...')
     errors = 0
     for name, rel in LOAD_ORDER:
+        if _MCP_MODE and name in _MCP_SKIP:
+            continue
         try:
             path = resolve_path(rel)
             mod = load_pyc(name, path)
@@ -202,7 +255,7 @@ def load_all() -> int:
                             pass
             
         except Exception as e:
-            print(f'  FAIL {name}: {e}', flush=True)
+            _log(f'  FAIL {name}: {e}')
             errors += 1
     
     # 加载应用市场模块（动态导入，PyInstaller 静态分析不到；非致命）
@@ -210,16 +263,46 @@ def load_all() -> int:
     return errors
 
 
+def _run_mcp_stdio() -> None:
+    """把当前进程变成 MCP stdio 服务（供 Trae / Wo Buddy 等 MCP 客户端连接）。
+
+    打包版 MCP 客户端配置里的 command 就是 exe 自身：
+        "Avatar AI.exe" -m app.mcp_server
+    所以这里必须直接跑 MCP 服务，不能走 GUI 分支。
+    """
+    mod = sys.modules.get('app.mcp_server')
+    if mod is None:
+        mod = load_pyc('app.mcp_server', resolve_path('app/__pycache__/mcp_server.cpython-312.pyc'))
+    server = getattr(mod, 'mcp', None)
+    if server is None:
+        _log('[bootloader] MCP server 实例不存在，无法启动')
+        sys.exit(2)
+    _log('[bootloader] 进入 MCP stdio 模式')
+    try:
+        server.run()  # 默认 transport="stdio"
+    except Exception as e:
+        _log(f'[bootloader] MCP server 异常退出: {e}')
+        sys.exit(3)
+
+
 def main():
+    if _MCP_MODE:
+        _ensure_stdio()
+
     errors = load_all()
 
     if errors > 0:
-        print(f'[bootloader] {errors} modules failed. Abort.', flush=True)
+        _log(f'[bootloader] {errors} modules failed. Abort.')
         sys.exit(1)
-    
-    print('[bootloader] all modules loaded, starting main()...', flush=True)
+
+    if _MCP_MODE:
+        _run_mcp_stdio()
+        return
+
+    _log('[bootloader] all modules loaded, starting main()...')
     app_main = sys.modules['app.main']
     app_main.main()
+
 
 if __name__ == '__main__':
     main()
