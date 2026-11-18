@@ -6,7 +6,7 @@
 > 
 > **免费版可长期使用**（不是试用版）。
 
-![Version](https://img.shields.io/badge/version-v2.14.26-4a90d9)
+![Version](https://img.shields.io/badge/version-v2.14.42-4a90d9)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![License](https://img.shields.io/badge/license-Proprietary%20%2F%20Free%20for%20Personal-lightgrey)
 ![Release](https://img.shields.io/github/v/release/Barrylaiheng/avatar-ai?label=release&sort=semver)
@@ -147,6 +147,15 @@ AI 学习你或团队的语气、习惯、偏好——回复不像机器人，�
 - 如果工具对你有帮助，请给个 ⭐
 
 ## Changelog
+
+### v2.14.42（2026-11-18）
+- 🆕 **微信群接龙分发 v1.0**：接群接龙接口，直接查到正在开的团并发给顾客
+- 🆕 **微信小程序分发 v1.4**：支持最多 4 个小程序入口，按名字发给顾客
+- 🔧 **省钱小助手 v2.0**：外卖红包 / 本地生活 / 影票门票 / 酒店 / 电商比价 五类场景可单独开关，填好单库 API Key 即用
+- 🛡️ **依赖安全升级**：修复 138 条已知漏洞中的全部高危项（Pillow / pypdf / aiohttp / urllib3 / certifi / Werkzeug 等），移除未使用的 PyPDF2
+- 🧹 发布前清理：源码树剔除历史备份页、补全 .gitignore、数据库文件移出版本控制
+- ✅ 首启引导第二步新增「开始使用」按钮，不再只能点右上角关闭
+- ✅ 启动自检对捆绑 exe 增加一次重试，避免被安全软件首扫误判成 FAIL
 
 ### v2.10.1（2026-10-19）
 - 🆕 **AI 开发助手（MCP）**：支持 TRAE / Wo Buddy 等 AI 工具通过 MCP 协议对话式开发自定义应用——说一句"帮我注册一个好单库选品应用"即可完成，不用写代码
