@@ -6,7 +6,7 @@
 > 
 > **免费版可长期使用**（不是试用版）。
 
-![Version](https://img.shields.io/badge/version-v2.14.42-4a90d9)
+![Version](https://img.shields.io/badge/version-v2.15.0-4a90d9)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![License](https://img.shields.io/badge/license-Proprietary%20%2F%20Free%20for%20Personal-lightgrey)
 ![Release](https://img.shields.io/github/v/release/Barrylaiheng/avatar-ai?label=release&sort=semver)
@@ -147,6 +147,14 @@ AI 学习你或团队的语气、习惯、偏好——回复不像机器人，�
 - 如果工具对你有帮助，请给个 ⭐
 
 ## Changelog
+
+### v2.15.0（2026-11-20）
+- 🆕 **公众号接入改版**：三步卡片（基础信息 → 消息推送 → 自定义菜单），要填的项和微信后台一一对应
+- 🆕 **一键恢复原菜单**：开启消息推送后后台自定义菜单会被停用，可一键复制成接口菜单，支持预览、回滚上一版
+- 🔧 **消息推送三项全自动**：URL / Token / EncodingAESKey 由本工具生成，安全或兼容模式自动生成 43 位 AESKey，复制到微信后台即可
+- 🐛 修复后台文字菜单恢复后点击无响应
+- 🐛 修复重启后 Token / AESKey / 菜单点击文案被清空
+- ⚡ 连接状态轮询降频，离开设置页停止请求，减少界面卡顿
 
 ### v2.14.42（2026-11-18）
 - 🆕 **群接龙分发 v1.0**：接群接龙接口，直接查到正在开的团并发给顾客
